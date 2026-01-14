@@ -1,0 +1,3 @@
+
+# Impacted Values Analysis — Starter Stack (EPSG:3979)
+... (omitted for brevity in this cell) ...

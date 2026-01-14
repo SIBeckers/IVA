@@ -1,0 +1,7 @@
+
+import VectorTileLayer from 'ol/layer/VectorTile'
+import VectorTileSource from 'ol/source/VectorTile'
+import MVT from 'ol/format/MVT'
+const tileserv = import.meta.env.VITE_TILESERV || 'http://localhost:7800'
+export const buildingsLayer = new VectorTileLayer({ source: new VectorTileSource({ format: new MVT(), url: `${tileserv}/risk.v_latest_feature_stats/{z}/{x}/{y}.pbf?properties=name,feature_set_id` }), declutter: true })
+export const ecumeneLayer = new VectorTileLayer({ source: new VectorTileSource({ format: new MVT(), url: `${tileserv}/risk.v_latest_ecumene/{z}/{x}/{y}.pbf?properties=name,p50,v_mean` }), declutter: true })

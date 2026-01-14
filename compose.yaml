@@ -1,0 +1,97 @@
+
+services:
+  postgis:
+    image: postgis/postgis:18-3.6
+    container_name: postgis
+    environment:
+      - POSTGRES_DB=impacted_values
+      - POSTGRES_USER=iva_job
+      - POSTGRES_PASSWORD=${PGPASSWORD}
+      # Initialize pg_hba.conf for SCRAM on first init:
+      - POSTGRES_INITDB_ARGS=--auth=scram-sha-256
+    ports:
+      - "5432:5432"
+    volumes:
+      # PG 18+: mount parent dir; image creates /var/lib/postgresql/18/...
+      - pgdata:/var/lib/postgresql
+      # Expose DDL file inside the container for initdb runner
+      - ./db/ddl.sql:/ddl/ddl.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "iva_job"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: run db/ddl.sql AFTER postgis is healthy, then exit
+  initdb:
+    image: postgres:18
+    container_name: iva-initdb
+    depends_on:
+      postgis:
+        condition: service_healthy
+    volumes:
+      - ./db/ddl.sql:/ddl/ddl.sql:ro
+    environment:
+      - APP_PGPASSWORD=${APP_PGPASSWORD}
+      - PGPASSWORD=${PGPASSWORD}
+    entrypoint:
+      - bash
+      - -lc
+      - >
+        psql -h postgis -U iva_job -d impacted_values
+        -v app_pass="$APP_PGPASSWORD" -v job_pass="$PGPASSWORD"
+        -f /ddl/ddl.sql
+    restart: "no"
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: pgbouncer
+    restart: unless-stopped
+    environment:
+      # Auto-generate userlist + pgbouncer.ini from URLs:
+      - DATABASE_URLS=postgres://iva_app:${APP_PGPASSWORD}@postgis/impacted_values,postgres://iva_job:${PGPASSWORD}@postgis/impacted_values
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=5000
+      - AUTH_TYPE=scram-sha-256
+    ports:
+      - "6432:5432"   # host 6432 -> container 5432
+    depends_on:
+      postgis:
+        condition: service_healthy
+
+  pg_tileserv:
+    image: pramsey/pg_tileserv:latest
+    container_name: pg_tileserv
+    environment:
+      # Container-to-container: use PgBouncer's CONTAINER port (5432)
+      - DATABASE_URL=postgresql://${APP_PGUSER}:${APP_PGPASSWORD}@pgbouncer:5432/impacted_values
+    ports:
+      - "7800:7800"
+    depends_on:
+      initdb:
+        condition: service_completed_successfully
+
+  pg_featureserv:
+    image: pramsey/pg_featureserv:latest
+    container_name: pg_featureserv
+    environment:
+      - DATABASE_URL=postgresql://${APP_PGUSER}:${APP_PGPASSWORD}@pgbouncer:5432/impacted_values
+    ports:
+      - "9000:9000"
+    depends_on:
+      initdb:
+        condition: service_completed_successfully
+
+  iva-job:
+    build:
+      context: ./job
+    container_name: iva-job
+    env_file: [ .env ]
+    depends_on:
+      initdb:
+        condition: service_completed_successfully
+    restart: on-failure
+    command: ["python", "-m", "iva_job.main"]
+
+volumes:
+  pgdata:
