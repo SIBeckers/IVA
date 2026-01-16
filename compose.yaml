@@ -1,54 +1,62 @@
-
 services:
   postgis:
-    image: postgis/postgis:18-3.6
+    build:
+      context: ./db
+      dockerfile: Dockerfile.db       # extends postgis/postgis:18-3.6 and installs ogr_fdw
+    image: iva/postgis:18-3.6-ogrfdw
     container_name: postgis
     environment:
       - POSTGRES_DB=impacted_values
       - POSTGRES_USER=iva_job
       - POSTGRES_PASSWORD=${PGPASSWORD}
-      # Initialize pg_hba.conf for SCRAM on first init:
+      # First-time cluster init: SCRAM
       - POSTGRES_INITDB_ARGS=--auth=scram-sha-256
     ports:
       - "5432:5432"
     volumes:
-      # PG 18+: mount parent dir; image creates /var/lib/postgresql/18/...
+      # PG 18 path (image creates /var/lib/postgresql/18/docker)
       - pgdata:/var/lib/postgresql
-      # Expose DDL file inside the container for initdb runner
+      # Make ddl.sql visible; init service will run it via psql
       - ./db/ddl.sql:/ddl/ddl.sql:ro
+      # Mount your data so ogr_fdw in ddl.sql can read gpkg files
+      - ./data:/data:ro
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "iva_job"]
+      test: ["CMD", "pg_isready", "-U", "iva_job", "-d", "impacted_values"]
       interval: 10s
       timeout: 5s
       retries: 10
+    networks:
+      - iva_net
 
-  # One-shot: run db/ddl.sql AFTER postgis is healthy, then exit
+  # One-shot init that applies db/ddl.sql WITH password variables
   initdb:
     image: postgres:18
     container_name: iva-initdb
     depends_on:
       postgis:
         condition: service_healthy
+    environment:
+      - PGPASSWORD=${PGPASSWORD}
+      - APP_PGPASSWORD=${APP_PGPASSWORD}
     volumes:
       - ./db/ddl.sql:/ddl/ddl.sql:ro
-    environment:
-      - APP_PGPASSWORD=${APP_PGPASSWORD}
-      - PGPASSWORD=${PGPASSWORD}
     entrypoint:
       - bash
       - -lc
       - >
         psql -h postgis -U iva_job -d impacted_values
-        -v app_pass="$APP_PGPASSWORD" -v job_pass="$PGPASSWORD"
+        -v app_pass="${APP_PGPASSWORD}" -v job_pass="${PGPASSWORD}"
         -f /ddl/ddl.sql
     restart: "no"
+    networks:
+      - iva_net
 
   pgbouncer:
     image: edoburu/pgbouncer:latest
     container_name: pgbouncer
     restart: unless-stopped
     environment:
-      # Auto-generate userlist + pgbouncer.ini from URLs:
+      # Generates userlist & pgbouncer.ini (uses the secrets you provide)
       - DATABASE_URLS=postgres://iva_app:${APP_PGPASSWORD}@postgis/impacted_values,postgres://iva_job:${PGPASSWORD}@postgis/impacted_values
       - POOL_MODE=transaction
       - MAX_CLIENT_CONN=5000
@@ -58,29 +66,42 @@ services:
     depends_on:
       postgis:
         condition: service_healthy
+    networks:
+      - iva_net
 
   pg_tileserv:
     image: pramsey/pg_tileserv:latest
     container_name: pg_tileserv
     environment:
-      # Container-to-container: use PgBouncer's CONTAINER port (5432)
-      - DATABASE_URL=postgresql://${APP_PGUSER}:${APP_PGPASSWORD}@pgbouncer:5432/impacted_values
+      - DATABASE_URL=postgresql://${APP_PGUSER:-iva_app}:${APP_PGPASSWORD}@pgbouncer:5432/impacted_values?sslmode=disable
+      - LISTEN_ADDR=0.0.0.0
+      - PORT=7800
     ports:
       - "7800:7800"
     depends_on:
       initdb:
         condition: service_completed_successfully
+      pgbouncer:
+        condition: service_started
+    networks:
+      - iva_net
 
   pg_featureserv:
     image: pramsey/pg_featureserv:latest
     container_name: pg_featureserv
     environment:
-      - DATABASE_URL=postgresql://${APP_PGUSER}:${APP_PGPASSWORD}@pgbouncer:5432/impacted_values
+      - DATABASE_URL=postgresql://${APP_PGUSER:-iva_app}:${APP_PGPASSWORD}@pgbouncer:5432/impacted_values?sslmode=disable
+      - LISTEN_ADDR=0.0.0.0
+      - PORT=9000
     ports:
       - "9000:9000"
     depends_on:
       initdb:
         condition: service_completed_successfully
+      pgbouncer:
+        condition: service_started
+    networks:
+      - iva_net
 
   iva-job:
     build:
@@ -88,10 +109,17 @@ services:
     container_name: iva-job
     env_file: [ .env ]
     depends_on:
+      postgis:
+        condition: service_healthy
       initdb:
         condition: service_completed_successfully
-    restart: on-failure
+    restart: unless-stopped
     command: ["python", "-m", "iva_job.main"]
+    networks:
+      - iva_net
 
 volumes:
   pgdata:
+
+networks:
+  iva_net:

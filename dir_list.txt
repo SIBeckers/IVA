@@ -1,0 +1,77 @@
+PS C:\Users\jbeckers\Documents\IVA> dir -R
+
+    Directory: C:\Users\jbeckers\Documents\IVA
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----        2026-01-14   1:06 PM                app
+d-----        2026-01-14   4:11 PM                data
+d-----        2026-01-14   1:06 PM                db
+d-----        2026-01-14   1:06 PM                job
+d-----        2026-01-14   3:17 PM                pgbouncer
+d-----        2026-01-14   2:52 PM                scripts
+-a----        2026-01-14   2:55 PM            523 .env
+-a----        2026-01-14   2:55 PM            523 .env.example
+-a----        2026-01-14   1:11 PM           4562 .gitignore
+-a----        2026-01-14   3:48 PM           2748 compose.yaml
+-a----        2025-10-31   9:08 AM          24926 justTheIntersection.R
+-a----        2026-01-14   1:06 PM            101 README.md
+-a----        2026-01-14   3:27 PM          30724 terminal_stdout.txt
+
+    Directory: C:\Users\jbeckers\Documents\IVA\app
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----        2026-01-14   1:06 PM                iva-map
+
+    Directory: C:\Users\jbeckers\Documents\IVA\app\iva-map
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----        2026-01-14   1:06 PM                src
+-a----        2026-01-14   1:06 PM            389 package.json
+-a----        2026-01-14   1:06 PM            153 vite.config.ts
+
+    Directory: C:\Users\jbeckers\Documents\IVA\app\iva-map\src
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----        2026-01-14   1:06 PM            768 App.tsx
+-a----        2026-01-14   1:06 PM             83 index.css
+-a----        2026-01-14   1:06 PM            635 layers.ts
+-a----        2026-01-14   1:06 PM            218 main.tsx
+-a----        2026-01-14   1:06 PM            308 projection.ts
+
+    Directory: C:\Users\jbeckers\Documents\IVA\data
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----        2026-01-14   2:14 PM      566149120 ab_structures_en.gpkg
+-a----        2025-07-16   7:59 AM        1773568 ECUMENE_V3.gpkg
+-a----        2025-07-16  10:16 AM       12210176 facilities.gpkg
+-a----        2025-07-16  10:19 AM        4210688 FirstNations.gpkg
+-a----        2025-07-16   8:01 AM       61616128 highways_v2.gpkg
+-a----        2025-05-13   9:13 AM       70275072 lcsd000a25p_e.gpkg
+-a----        2025-07-16   8:03 AM       17170432 railways_v2.gpkg
+
+    Directory: C:\Users\jbeckers\Documents\IVA\db
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----        2026-01-14   4:17 PM          10779 ddl.sql
+
+    Directory: C:\Users\jbeckers\Documents\IVA\job
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+d-----        2026-01-14   1:06 PM                iva_job
+-a----        2026-01-14   1:06 PM            220 Dockerfile
+-a----        2026-01-14   1:06 PM            154 requirements.txt
+
+    Directory: C:\Users\jbeckers\Documents\IVA\job\iva_job
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----        2026-01-14   1:06 PM           1605 db.py
+-a----        2026-01-14   2:29 PM           3897 firestarr.py
+-a----        2026-01-14   1:06 PM           2565 loaders.py
+-a----        2026-01-14   3:11 PM           3284 main.py
+-a----        2026-01-14   1:06 PM            641 stats.py
+-a----        2026-01-14   1:06 PM              0 __init__.py
+
+    Directory: C:\Users\jbeckers\Documents\IVA\scripts
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----        2026-01-14   3:48 PM           1060 init-db.sh
