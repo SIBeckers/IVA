@@ -76,6 +76,12 @@ services:
       - DATABASE_URL=postgresql://${APP_PGUSER:-iva_app}:${APP_PGPASSWORD}@pgbouncer:5432/impacted_values?sslmode=disable
       - LISTEN_ADDR=0.0.0.0
       - PORT=7800
+      - TS_COORDINATESYSTEM_SRID=3978
+      - TS_COORDINATESYSTEM_XMIN=${IVA_3978_XMIN}
+      - TS_COORDINATESYSTEM_YMIN=${IVA_3978_YMIN}
+      - TS_COORDINATESYSTEM_XMAX=${IVA_3978_XMAX}
+      - TS_COORDINATESYSTEM_YMAX=${IVA_3978_YMAX}
+
     ports:
       - "7800:7800"
     depends_on:

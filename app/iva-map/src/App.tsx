@@ -4,9 +4,9 @@ import { useEffect, useRef, useState } from 'react';
 import Map from 'ol/Map';
 import View from 'ol/View';
 import { LayerControl } from './LayerControl';
-import { CANADA_3979 } from './projection';
+import { proj3978, EXTENT_3978 } from './projection';
 import { buildLayerEntries, LayerEntry } from './layers';
-
+import { buildCbmtBasemapLayer } from './basemap';
 export default function App() {
   const mapDivRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<Map | null>(null);
@@ -14,13 +14,14 @@ export default function App() {
 
   useEffect(() => {
     if (!mapDivRef.current) return;
-
+    const center3978: [number, number] = [(EXTENT_3978[0] + EXTENT_3978[2]) / 2,(EXTENT_3978[1] + EXTENT_3978[3]) / 2,];
     const map = new Map({
       target: mapDivRef.current,
       view: new View({
-        projection: CANADA_3979,
-        center: [0, 0],
+        projection: proj3978,
+        center: center3978,
         zoom: 3,
+        extent: EXTENT_3978,
       }),
       layers: entries.map(e => {
         e.layer.setVisible(e.visible);
@@ -30,6 +31,17 @@ export default function App() {
     });
 
     mapRef.current = map;
+    
+    buildCbmtBasemapLayer().then((baseLayer) => {
+      baseLayer.set('id', 'cbmt');
+      baseLayer.setVisible(true);
+      map.getLayers().insertAt(0, baseLayer); // keep it underneath overlays
+      setEntries((prev) => [
+        { id: 'cbmt', layer: baseLayer as any, visible: true, label: 'Base (CBMT 3978)' },
+        ...prev,
+      ]);
+    });
+
     return () => {
       map.setTarget(undefined);
       mapRef.current = null;

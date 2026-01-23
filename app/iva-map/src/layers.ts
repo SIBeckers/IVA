@@ -6,6 +6,7 @@ import MVT from 'ol/format/MVT';
 import TileLayer from 'ol/layer/Tile';
 import XYZ from 'ol/source/XYZ';
 import { Style, Stroke, Fill, Circle as CircleStyle } from 'ol/style';
+import { proj3978, tileGrid3978 } from './projection';
 
 export type LayerEntry = {
   id: string;
@@ -52,23 +53,24 @@ function polygonChoroplethStyle(feature: any) {
   return stylePoly(c, '#333', 0.5);
 }
 
+
 function mvt(url: string, style?: (f: any) => Style) {
   return new VectorTileLayer({
     properties: { url },
-    source: new VectorTileSource({ format: new MVT(), url }),
+    source: new VectorTileSource({
+      format: new MVT(),
+      url,
+      projection: proj3978,
+      tileGrid: tileGrid3978,
+    }),
     style: style ? (f) => style(f) : undefined,
     declutter: true,
     visible: true,
   });
 }
 
+
 export function buildLayerEntries(): LayerEntry[] {
-  // Base
-  const base = new TileLayer({
-    properties: { id: 'osm' },
-    source: new XYZ({ url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png' }),
-    visible: true,
-  });
 
   // Reference geography
   const csd = mvt(
@@ -130,7 +132,6 @@ export function buildLayerEntries(): LayerEntry[] {
   ); facilitiesRaw.set('id','facilities_raw');
 
   return [
-    { id: 'osm',      layer: base,          visible: true,  label: 'Base (OSM)' },
     { id: 'csd',      layer: csd,           visible: true,  label: 'Census Subdivisions (2025)' },
 
     { id: 'd3',       layer: d3,            visible: true,  label: 'Values (D3)' },
