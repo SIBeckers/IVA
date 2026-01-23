@@ -33,7 +33,7 @@ const fnStyle = stylePoly('rgba(148,0,211,0.25)', '#6a0dad', 0.8);
 const highwaysLine = new Style({ stroke: strokeThin('#f1b814', 1.5) });
 const railLine = new Style({ stroke: strokeThin('#666', 1.5) });
 
-const facilitiesPoly = stylePoly('rgba(31,120,180,0.15)', '#0c3a66', 1.2);
+const facilityPoint = styleCircle('#1f78b4', 4, '#0c3a66');
 
 const circleLow = styleCircle('#4daf4a', 4, '#2b7a2b');
 const circleMed = styleCircle('#ff7f00', 5, '#b35a00');
@@ -128,7 +128,7 @@ export function buildLayerEntries(): LayerEntry[] {
 
   const facilitiesRaw = mvt(
     `${TILESERV}/risk.v_features_facilities_raw/{z}/{x}/{y}.pbf?properties=name`,
-    () => facilitiesPoly
+    () => facilityPoint
   ); facilitiesRaw.set('id','facilities_raw');
 
   return [

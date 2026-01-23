@@ -32,15 +32,27 @@ export default function App() {
 
     mapRef.current = map;
     
-    buildCbmtBasemapLayer().then((baseLayer) => {
-      baseLayer.set('id', 'cbmt');
-      baseLayer.setVisible(true);
-      map.getLayers().insertAt(0, baseLayer); // keep it underneath overlays
-      setEntries((prev) => [
-        { id: 'cbmt', layer: baseLayer as any, visible: true, label: 'Base (CBMT 3978)' },
-        ...prev,
-      ]);
-    });
+    
+    buildCbmtBasemapLayer()
+      .then((baseLayer) => {
+        baseLayer.set('id', 'cbmt');
+        baseLayer.setVisible(true);
+        map.getLayers().insertAt(0, baseLayer);
+
+        // Turn off OSM if present (it will otherwise hide CBMT)
+        const osm = map.getLayers().getArray().find(l => l.get('id') === 'osm');
+        if (osm) osm.setVisible(false);
+
+        // Keep LayerControl state in sync
+        setEntries((prev) => {
+          const next = prev.map(e => e.id === 'osm' ? { ...e, visible: false } : e);
+          return [
+            { id: 'cbmt', layer: baseLayer as any, visible: true, label: 'Base (CBMT 3978)' },
+            ...next,
+          ];
+        });
+      })
+      .catch((err) => console.error('CBMT basemap failed to load:', err));
 
     return () => {
       map.setTarget(undefined);

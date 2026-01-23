@@ -126,20 +126,41 @@ SELECT feature_id,
 FROM risk.v_latest_feature_stats
 GROUP BY feature_id;
 
+
 CREATE OR REPLACE VIEW risk.v_latest_ecumene AS
-  SELECT * FROM risk.v_latest_feature_stats
-  WHERE feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='ecumene');
+SELECT
+  run_date, forecast_day, feature_id, n, v_min, p05, p25, p50, v_mean, p75, p95, v_max, evacuated,
+  feature_set_id, name, attrs,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+FROM risk.v_latest_feature_stats
+WHERE feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='ecumene');
+
 CREATE OR REPLACE VIEW risk.v_latest_first_nations AS
-  SELECT * FROM risk.v_latest_feature_stats
-  WHERE feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='first_nations');
+SELECT run_date, forecast_day, feature_id, n, v_min, p05, p25, p50, v_mean, p75, p95, v_max, evacuated,
+  feature_set_id, name, attrs,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+FROM risk.v_latest_feature_stats
+WHERE feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='first_nations');
+
 CREATE OR REPLACE VIEW risk.v_latest_highways AS
-  SELECT * FROM risk.v_latest_feature_stats
-  WHERE feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='highways');
+SELECT run_date, forecast_day, feature_id, n, v_min, p05, p25, p50, v_mean, p75, p95, v_max, evacuated,
+  feature_set_id, name, attrs,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiLineString, 3978) AS geom
+FROM risk.v_latest_feature_stats
+WHERE feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='highways');
+
 CREATE OR REPLACE VIEW risk.v_latest_rail AS
-  SELECT * FROM risk.v_latest_feature_stats
-  WHERE feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='rail');
+SELECT run_date, forecast_day, feature_id, n, v_min, p05, p25, p50, v_mean, p75, p95, v_max, evacuated,
+  feature_set_id, name, attrs,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiLineString, 3978) AS geom
+FROM risk.v_latest_feature_stats
+WHERE feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='rail');
+
 CREATE OR REPLACE VIEW risk.v_latest_facilities AS
-  SELECT * FROM risk.v_latest_feature_stats
+SELECT run_date, forecast_day, feature_id, n, v_min, p05, p25, p50, v_mean, p75, p95, v_max, evacuated,
+  feature_set_id, name, attrs,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+FROM risk.v_latest_feature_stats
   WHERE feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='facilities');
 
 CREATE OR REPLACE VIEW risk.v_features_raw AS
@@ -152,7 +173,7 @@ SELECT s.id AS stat_id, s.run_id, r.run_date, r.forecast_day, r.wmstime,
        s.feature_id, fs.code AS feature_set_code,
        s.n, s.v_min, s.p05, s.p25, s.p50, s.v_mean, s.p75, s.p95, s.v_max, s.evacuated,
        f.name AS feature_name, f.attrs AS feature_attrs,
-       f.geom AS geom,
+       ST_Transform(f.geom, 3978)::geometry(Geometry, 3978) AS geom,
        s.created_at AS stat_created_at
 FROM risk.feature_stats s
 JOIN risk.runs r ON r.id = s.run_id
@@ -175,8 +196,15 @@ CREATE TABLE IF NOT EXISTS public.census_subdivisions_2025 (
 );
 CREATE INDEX IF NOT EXISTS csd_2025_geom_gix ON public.census_subdivisions_2025 USING GIST (geom);
 
+
 CREATE OR REPLACE VIEW public.census_subdivisions AS
-  SELECT csduid, name, prname, geom FROM public.census_subdivisions_2025;
+SELECT
+  csduid,
+  name,
+  prname,
+  ST_Transform(geom, 3978)::geometry(MultiPolygon, 3978) AS geom
+FROM public.census_subdivisions_2025;
+
 
 GRANT SELECT ON public.census_subdivisions_2025, public.census_subdivisions TO iva_app;
 
@@ -238,10 +266,10 @@ SELECT s.run_id,
        MAX(s.v_max) AS max_prob
 FROM risk.feature_stats s
 JOIN risk.features f ON f.id = s.feature_id
-JOIN public.census_subdivisions csd ON ST_Intersects(f.geom, csd.geom)
+JOIN public.census_subdivisions_2025 csd ON ST_Intersects(f.geom, csd.geom)
 WHERE f.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='buildings')
 GROUP BY s.run_id, csd.csduid;
-CREATE INDEX IF NOT EXISTS mv_buildings_csd_agg_idx ON risk.mv_buildings_csd_agg (run_id, csd_id);
+CREATE UNIQUE INDEX IF NOT EXISTS mv_buildings_csd_agg_idx ON risk.mv_buildings_csd_agg (run_id, csd_id);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS risk.mv_buildings_ecumene_agg AS
 SELECT s.run_id,
@@ -256,7 +284,7 @@ JOIN risk.features fz
  AND ST_Intersects(f.geom, fz.geom)
 WHERE f.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='buildings')
 GROUP BY s.run_id, fz.source_pk;
-CREATE INDEX IF NOT EXISTS mv_buildings_ecumene_agg_idx ON risk.mv_buildings_ecumene_agg (run_id, ecumene_pk);
+CREATE UNIQUE INDEX IF NOT EXISTS mv_buildings_ecumene_agg_idx ON risk.mv_buildings_ecumene_agg (run_id, ecumene_pk);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS risk.mv_buildings_fn_agg AS
 SELECT s.run_id,
@@ -271,18 +299,20 @@ JOIN risk.features fn
  AND ST_Intersects(f.geom, fn.geom)
 WHERE f.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='buildings')
 GROUP BY s.run_id, fn.source_pk;
-CREATE INDEX IF NOT EXISTS mv_buildings_fn_agg_idx ON risk.mv_buildings_fn_agg (run_id, fn_pk);
+CREATE UNIQUE INDEX IF NOT EXISTS mv_buildings_fn_agg_idx ON risk.mv_buildings_fn_agg (run_id, fn_pk);
 
 -- Latest (geom-included) intersection views for publishing
 CREATE OR REPLACE VIEW risk.v_buildings_csd_agg_latest AS
-SELECT r.run_date, r.forecast_day, a.csd_id, a.bld_count, a.v_mean_p50, a.max_prob, csd.geom
+SELECT r.run_date, r.forecast_day, a.csd_id, a.bld_count, a.v_mean_p50, a.max_prob, 
+  ST_Multi(ST_Transform(csd.geom, 3978))::geometry(MultiPolygon, 3978) AS geom
 FROM risk.mv_buildings_csd_agg a
 JOIN risk.runs r ON r.id = a.run_id
 JOIN risk.v_latest_runs lr ON lr.id = a.run_id
 JOIN public.census_subdivisions csd ON csd.csduid = a.csd_id;
 
 CREATE OR REPLACE VIEW risk.v_buildings_ecumene_agg_latest AS
-SELECT r.run_date, r.forecast_day, a.ecumene_pk, a.bld_count, a.v_mean_p50, a.max_prob, fz.geom
+SELECT r.run_date, r.forecast_day, a.ecumene_pk, a.bld_count, a.v_mean_p50, a.max_prob, 
+  ST_Multi(ST_Transform(fz.geom, 3978))::geometry(MultiPolygon, 3978) AS geom
 FROM risk.mv_buildings_ecumene_agg a
 JOIN risk.runs r ON r.id = a.run_id
 JOIN risk.v_latest_runs lr ON lr.id = a.run_id
@@ -291,7 +321,8 @@ JOIN risk.features fz
  AND fz.source_pk = a.ecumene_pk;
 
 CREATE OR REPLACE VIEW risk.v_buildings_fn_agg_latest AS
-SELECT r.run_date, r.forecast_day, a.fn_pk, a.bld_count, a.v_mean_p50, a.max_prob, fn.geom
+SELECT r.run_date, r.forecast_day, a.fn_pk, a.bld_count, a.v_mean_p50, a.max_prob, 
+  ST_Multi(ST_Transform(fn.geom, 3978))::geometry(MultiPolygon, 3978) AS geom
 FROM risk.mv_buildings_fn_agg a
 JOIN risk.runs r ON r.id = a.run_id
 JOIN risk.v_latest_runs lr ON lr.id = a.run_id
@@ -431,25 +462,36 @@ END$$;
 -- ------------------------------------------------------------
 -- Per-set RAW views (nice endpoints for tiles/feature services)
 -- ------------------------------------------------------------
+
 CREATE OR REPLACE VIEW risk.v_features_ecumene_raw AS
-  SELECT id, feature_set_code, source_pk, name, attrs, geom, created_at
-  FROM risk.v_features_raw WHERE feature_set_code='ecumene';
+SELECT
+  id, feature_set_code, source_pk, name, attrs, created_at,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+FROM risk.v_features_raw WHERE feature_set_code='ecumene';
 
 CREATE OR REPLACE VIEW risk.v_features_first_nations_raw AS
-  SELECT id, feature_set_code, source_pk, name, attrs, geom, created_at
-  FROM risk.v_features_raw WHERE feature_set_code='first_nations';
+SELECT
+  id, feature_set_code, source_pk, name, attrs, created_at,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+FROM risk.v_features_raw WHERE feature_set_code='first_nations';
 
 CREATE OR REPLACE VIEW risk.v_features_highways_raw AS
-  SELECT id, feature_set_code, source_pk, name, attrs, geom, created_at
-  FROM risk.v_features_raw WHERE feature_set_code='highways';
+SELECT
+  id, feature_set_code, source_pk, name, attrs, created_at,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiLineString, 3978) AS geom
+FROM risk.v_features_raw WHERE feature_set_code='highways';
 
 CREATE OR REPLACE VIEW risk.v_features_rail_raw AS
-  SELECT id, feature_set_code, source_pk, name, attrs, geom, created_at
-  FROM risk.v_features_raw WHERE feature_set_code='rail';
+SELECT
+  id, feature_set_code, source_pk, name, attrs, created_at,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiLineString, 3978) AS geom
+FROM risk.v_features_raw WHERE feature_set_code='rail';
 
 CREATE OR REPLACE VIEW risk.v_features_facilities_raw AS
-  SELECT id, feature_set_code, source_pk, name, attrs, geom, created_at
-  FROM risk.v_features_raw WHERE feature_set_code='facilities';
+SELECT 
+  id, feature_set_code, source_pk, name, attrs, created_at,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+FROM risk.v_features_raw WHERE feature_set_code='facilities';
 
 -- ------------------------------------------------------------
 -- Grants / defaults
