@@ -357,3 +357,7 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+*.gpkg
+*.zip
+*.7z
