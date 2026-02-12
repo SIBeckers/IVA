@@ -361,3 +361,6 @@ vite.config.ts.timestamp-*
 *.gpkg
 *.zip
 *.7z
+textfiles/*.txt
+README_files/*
+README.html

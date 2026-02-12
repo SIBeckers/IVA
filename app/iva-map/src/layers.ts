@@ -3,56 +3,65 @@
 import VectorTileLayer from 'ol/layer/VectorTile';
 import VectorTileSource from 'ol/source/VectorTile';
 import MVT from 'ol/format/MVT';
-import TileLayer from 'ol/layer/Tile';
-import XYZ from 'ol/source/XYZ';
-import { Style, Stroke, Fill, Circle as CircleStyle } from 'ol/style';
+import type BaseLayer from 'ol/layer/Base';
+import { Style, Stroke, Fill } from 'ol/style';
 import { proj3978, tileGrid3978 } from './projection';
+
+export type LayerKind = 'base' | 'overlay';
 
 export type LayerEntry = {
   id: string;
-  layer: VectorTileLayer<any> | TileLayer<any>;
+  layer: BaseLayer;
   visible: boolean;
   label: string;
+  group: string;
+  kind: LayerKind;
 };
 
 const TILESERV = import.meta.env.VITE_TILESERV_BASE ?? 'http://localhost:7800';
 
-// ---- Styles
 const strokeThin = (color: string, w = 1) => new Stroke({ color, width: w });
-
-const stylePoly = (fillColor: string, strokeColor = '#333', w = 0.6) =>
+const stylePoly = (fillColor: string, strokeColor = '#333', w = 0.8) =>
   new Style({ fill: new Fill({ color: fillColor }), stroke: strokeThin(strokeColor, w) });
-
-const styleCircle = (fillColor: string, r = 4, strokeColor = '#113' ) =>
-  new Style({ image: new CircleStyle({ radius: r, fill: new Fill({ color: fillColor }), stroke: strokeThin(strokeColor, 1) }) });
+const styleLine = (color: string, w = 1.8) => new Style({ stroke: strokeThin(color, w) });
 
 const csdStyle = stylePoly('rgba(34,139,34,0.10)', '#2e8b57', 1);
-const ecumeneStyle = stylePoly('rgba(50,205,50,0.25)', '#2e8b57', 0.8);
-const fnStyle = stylePoly('rgba(148,0,211,0.25)', '#6a0dad', 0.8);
+const ecumeneBase = stylePoly('rgba(50,205,50,0.15)', '#2e8b57', 0.8);
+const fnBase = stylePoly('rgba(148,0,211,0.15)', '#6a0dad', 0.8);
+const facilitiesBase = stylePoly('rgba(31,120,180,0.12)', '#0c3a66', 1.0);
 
-const highwaysLine = new Style({ stroke: strokeThin('#f1b814', 1.5) });
-const railLine = new Style({ stroke: strokeThin('#666', 1.5) });
+const highwaysBase = styleLine('#f1b814', 1.8);
+const railBase = styleLine('#666', 1.8);
 
-const facilitiesPoly = stylePoly('rgba(31,120,180,0.15)', '#0c3a66', 1.2);
+function rampFill(v: number) {
+  if (v >= 0.6) return 'rgba(228,26,28,0.45)';
+  if (v >= 0.2) return 'rgba(255,127,0,0.35)';
+  return 'rgba(77,175,74,0.25)';
+}
 
-const circleLow = styleCircle('#4daf4a', 4, '#2b7a2b');
-const circleMed = styleCircle('#ff7f00', 5, '#b35a00');
-const circleHigh = styleCircle('#e41a1c', 6, '#a41315');
+function polyRiskStyle(feature: any) {
+  const vmax = Number(feature.get('v_max') ?? 0);
+  const isNew = !!feature.get('is_new');
+  const evacuated = !!feature.get('evacuated');
+  const fill = rampFill(vmax);
+  const stroke = evacuated ? '#111' : isNew ? '#ff7f00' : '#333';
+  const w = evacuated ? 2.0 : isNew ? 1.6 : 0.9;
+  return stylePoly(fill, stroke, w);
+}
 
-function valuesStyle(feature: any) {
-  const vmax = feature.get('v_max');
-  const img = vmax >= 0.6 ? circleHigh : vmax >= 0.2 ? circleMed : circleLow;
-  return img;
+function lineRiskStyle(feature: any) {
+  const vmax = Number(feature.get('v_max') ?? 0);
+  const isNew = !!feature.get('is_new');
+  const evacuated = !!feature.get('evacuated');
+  const color = evacuated ? '#111' : isNew ? '#ff7f00' : vmax >= 0.6 ? '#e41a1c' : vmax >= 0.2 ? '#f1b814' : '#4daf4a';
+  const w = evacuated ? 3.0 : isNew ? 2.6 : 2.0;
+  return styleLine(color, w);
 }
 
 function polygonChoroplethStyle(feature: any) {
-  const maxProb = feature.get('max_prob');
-  let c = 'rgba(0,0,0,0.05)';
-  if (maxProb >= 0.6) c = 'rgba(228,26,28,0.55)';
-  else if (maxProb >= 0.2) c = 'rgba(255,127,0,0.45)';
-  return stylePoly(c, '#333', 0.5);
+  const maxProb = Number(feature.get('max_prob') ?? 0);
+  return stylePoly(rampFill(maxProb), '#333', 0.8);
 }
-
 
 function mvt(url: string, style?: (f: any) => Style) {
   return new VectorTileLayer({
@@ -69,82 +78,86 @@ function mvt(url: string, style?: (f: any) => Style) {
   });
 }
 
-
 export function buildLayerEntries(): LayerEntry[] {
-
   // Reference geography
-  const csd = mvt(
-    `${TILESERV}/public.census_subdivisions/{z}/{x}/{y}.pbf?properties=csduid,name,prname`,
-    () => csdStyle
-  ); csd.set('id','csd');
+  const csd = mvt(`${TILESERV}/public.census_subdivisions/{z}/{x}/{y}.pbf?properties=csduid,name,prname`, () => csdStyle);
+  csd.set('id', 'csd');
 
-  // Values layers (latest D3/D7)
-  const d3 = mvt(
-    `${TILESERV}/risk.v_feature_stats_d3/{z}/{x}/{y}.pbf?properties=feature_set_code,v_mean,p50,v_max,feature_name`,
-    valuesStyle
-  ); d3.set('id','d3');
+  // Latest-per-theme risk layers (D3/D7)
+  const ecumeneD3 = mvt(`${TILESERV}/risk.v_latest_ecumene_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
+  ecumeneD3.set('id', 'ecumene_d3');
+  const ecumeneD7 = mvt(`${TILESERV}/risk.v_latest_ecumene_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
+  ecumeneD7.set('id', 'ecumene_d7');
 
-  const d7 = mvt(
-    `${TILESERV}/risk.v_feature_stats_d7/{z}/{x}/{y}.pbf?properties=feature_set_code,v_mean,p50,v_max,feature_name`,
-    valuesStyle
-  ); d7.set('id','d7');
+  const fnD3 = mvt(`${TILESERV}/risk.v_latest_first_nations_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
+  fnD3.set('id', 'fn_d3');
+  const fnD7 = mvt(`${TILESERV}/risk.v_latest_first_nations_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
+  fnD7.set('id', 'fn_d7');
 
-  // Intersection (latest) polygon choropleths
-  const bldCsd = mvt(
-    `${TILESERV}/risk.v_buildings_csd_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`,
-    polygonChoroplethStyle
-  ); bldCsd.set('id','bld_csd');
+  const facilitiesD3 = mvt(`${TILESERV}/risk.v_latest_facilities_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
+  facilitiesD3.set('id', 'fac_d3');
+  const facilitiesD7 = mvt(`${TILESERV}/risk.v_latest_facilities_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
+  facilitiesD7.set('id', 'fac_d7');
 
-  const bldEcu = mvt(
-    `${TILESERV}/risk.v_buildings_ecumene_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`,
-    polygonChoroplethStyle
-  ); bldEcu.set('id','bld_ecu');
+  const highwaysD3 = mvt(`${TILESERV}/risk.v_latest_highways_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, lineRiskStyle);
+  highwaysD3.set('id', 'hw_d3');
+  const highwaysD7 = mvt(`${TILESERV}/risk.v_latest_highways_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, lineRiskStyle);
+  highwaysD7.set('id', 'hw_d7');
 
-  const bldFn = mvt(
-    `${TILESERV}/risk.v_buildings_fn_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`,
-    polygonChoroplethStyle
-  ); bldFn.set('id','bld_fn');
+  const railD3 = mvt(`${TILESERV}/risk.v_latest_rail_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, lineRiskStyle);
+  railD3.set('id', 'rail_d3');
+  const railD7 = mvt(`${TILESERV}/risk.v_latest_rail_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, lineRiskStyle);
+  railD7.set('id', 'rail_d7');
+
+  // Buildings drill-down is intentionally NOT published as a full-layer here (millions of polygons).
+  // Instead, use the aggregate choropleths below, and add a drill-down mode later.
+
+  // Building aggregates
+  const bldCsd = mvt(`${TILESERV}/risk.v_buildings_csd_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`, polygonChoroplethStyle);
+  bldCsd.set('id', 'bld_csd');
+  const bldEcu = mvt(`${TILESERV}/risk.v_buildings_ecumene_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`, polygonChoroplethStyle);
+  bldEcu.set('id', 'bld_ecu');
+  const bldFn = mvt(`${TILESERV}/risk.v_buildings_fn_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`, polygonChoroplethStyle);
+  bldFn.set('id', 'bld_fn');
 
   // Raw reference layers
-  const ecumeneRaw = mvt(
-    `${TILESERV}/risk.v_features_ecumene_raw/{z}/{x}/{y}.pbf?properties=name`,
-    () => ecumeneStyle
-  ); ecumeneRaw.set('id','ecumene_raw');
-
-  const fnRaw = mvt(
-    `${TILESERV}/risk.v_features_first_nations_raw/{z}/{x}/{y}.pbf?properties=name`,
-    () => fnStyle
-  ); fnRaw.set('id','first_nations_raw');
-
-  const highwaysRaw = mvt(
-    `${TILESERV}/risk.v_features_highways_raw/{z}/{x}/{y}.pbf?properties=name`,
-    () => highwaysLine
-  ); highwaysRaw.set('id','highways_raw');
-
-  const railRaw = mvt(
-    `${TILESERV}/risk.v_features_rail_raw/{z}/{x}/{y}.pbf?properties=name`,
-    () => railLine
-  ); railRaw.set('id','rail_raw');
-
-  const facilitiesRaw = mvt(
-    `${TILESERV}/risk.v_features_facilities_raw/{z}/{x}/{y}.pbf?properties=name`,
-    () => facilitiesPoly
-  ); facilitiesRaw.set('id','facilities_raw');
+  const ecumeneRaw = mvt(`${TILESERV}/risk.v_features_ecumene_raw/{z}/{x}/{y}.pbf?properties=name`, () => ecumeneBase);
+  ecumeneRaw.set('id', 'ecumene_raw');
+  const fnRaw = mvt(`${TILESERV}/risk.v_features_first_nations_raw/{z}/{x}/{y}.pbf?properties=name`, () => fnBase);
+  fnRaw.set('id', 'first_nations_raw');
+  const highwaysRaw = mvt(`${TILESERV}/risk.v_features_highways_raw/{z}/{x}/{y}.pbf?properties=name`, () => highwaysBase);
+  highwaysRaw.set('id', 'highways_raw');
+  const railRaw = mvt(`${TILESERV}/risk.v_features_rail_raw/{z}/{x}/{y}.pbf?properties=name`, () => railBase);
+  railRaw.set('id', 'rail_raw');
+  const facilitiesRaw = mvt(`${TILESERV}/risk.v_features_facilities_raw/{z}/{x}/{y}.pbf?properties=name`, () => facilitiesBase);
+  facilitiesRaw.set('id', 'facilities_raw');
 
   return [
-    { id: 'csd',      layer: csd,           visible: true,  label: 'Census Subdivisions (2025)' },
+    // Basemap placeholder entry (actual layer inserted in App.tsx)
+    { id: 'cbmt', layer: new VectorTileLayer(), visible: true, label: 'Base (CBMT 3978)', group: 'Basemap', kind: 'base' },
 
-    { id: 'd3',       layer: d3,            visible: true,  label: 'Values (D3)' },
-    { id: 'd7',       layer: d7,            visible: false, label: 'Values (D7)' },
+    { id: 'csd', layer: csd, visible: true, label: 'Census Subdivisions (2025)', group: 'Reference', kind: 'overlay' },
 
-    { id: 'bld_csd',  layer: bldCsd,        visible: false, label: 'Buildings → CSD (latest)' },
-    { id: 'bld_ecu',  layer: bldEcu,        visible: false, label: 'Buildings → Ecumene (latest)' },
-    { id: 'bld_fn',   layer: bldFn,         visible: false, label: 'Buildings → First Nations (latest)' },
+    { id: 'ecumene_d3', layer: ecumeneD3, visible: true, label: 'Ecumene (D3)', group: 'D3 Risk', kind: 'overlay' },
+    { id: 'fn_d3', layer: fnD3, visible: false, label: 'First Nations (D3)', group: 'D3 Risk', kind: 'overlay' },
+    { id: 'fac_d3', layer: facilitiesD3, visible: false, label: 'Facilities (D3)', group: 'D3 Risk', kind: 'overlay' },
+    { id: 'hw_d3', layer: highwaysD3, visible: false, label: 'Highways (D3)', group: 'D3 Risk', kind: 'overlay' },
+    { id: 'rail_d3', layer: railD3, visible: false, label: 'Rail (D3)', group: 'D3 Risk', kind: 'overlay' },
 
-    { id: 'ecumene_raw',      layer: ecumeneRaw,    visible: false, label: 'Ecumene (raw)' },
-    { id: 'first_nations_raw',layer: fnRaw,         visible: false, label: 'First Nations (raw)' },
-    { id: 'highways_raw',     layer: highwaysRaw,   visible: false, label: 'Highways (raw)' },
-    { id: 'rail_raw',         layer: railRaw,       visible: false, label: 'Railways (raw)' },
-    { id: 'facilities_raw',   layer: facilitiesRaw, visible: false, label: 'Facilities (raw)' },
+    { id: 'ecumene_d7', layer: ecumeneD7, visible: false, label: 'Ecumene (D7)', group: 'D7 Risk', kind: 'overlay' },
+    { id: 'fn_d7', layer: fnD7, visible: false, label: 'First Nations (D7)', group: 'D7 Risk', kind: 'overlay' },
+    { id: 'fac_d7', layer: facilitiesD7, visible: false, label: 'Facilities (D7)', group: 'D7 Risk', kind: 'overlay' },
+    { id: 'hw_d7', layer: highwaysD7, visible: false, label: 'Highways (D7)', group: 'D7 Risk', kind: 'overlay' },
+    { id: 'rail_d7', layer: railD7, visible: false, label: 'Rail (D7)', group: 'D7 Risk', kind: 'overlay' },
+
+    { id: 'bld_csd', layer: bldCsd, visible: false, label: 'Buildings → CSD (latest)', group: 'Buildings Aggregates', kind: 'overlay' },
+    { id: 'bld_ecu', layer: bldEcu, visible: false, label: 'Buildings → Ecumene (latest)', group: 'Buildings Aggregates', kind: 'overlay' },
+    { id: 'bld_fn', layer: bldFn, visible: false, label: 'Buildings → First Nations (latest)', group: 'Buildings Aggregates', kind: 'overlay' },
+
+    { id: 'ecumene_raw', layer: ecumeneRaw, visible: false, label: 'Ecumene (raw)', group: 'Raw Reference', kind: 'overlay' },
+    { id: 'first_nations_raw', layer: fnRaw, visible: false, label: 'First Nations (raw)', group: 'Raw Reference', kind: 'overlay' },
+    { id: 'highways_raw', layer: highwaysRaw, visible: false, label: 'Highways (raw)', group: 'Raw Reference', kind: 'overlay' },
+    { id: 'rail_raw', layer: railRaw, visible: false, label: 'Rail (raw)', group: 'Raw Reference', kind: 'overlay' },
+    { id: 'facilities_raw', layer: facilitiesRaw, visible: false, label: 'Facilities (raw)', group: 'Raw Reference', kind: 'overlay' },
   ];
 }
