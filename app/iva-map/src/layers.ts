@@ -1,10 +1,10 @@
-
 // app/iva-map/src/layers.ts
 import VectorTileLayer from 'ol/layer/VectorTile';
 import VectorTileSource from 'ol/source/VectorTile';
 import MVT from 'ol/format/MVT';
 import type BaseLayer from 'ol/layer/Base';
 import { Style, Stroke, Fill } from 'ol/style';
+
 import { proj3978, tileGrid3978 } from './projection';
 
 export type LayerKind = 'base' | 'overlay';
@@ -20,18 +20,22 @@ export type LayerEntry = {
 
 const TILESERV = import.meta.env.VITE_TILESERV_BASE ?? 'http://localhost:7800';
 
+// Toggle this to true temporarily to see feature counts in console
+const DEBUG_TILE_COUNTS = true;
+
 const strokeThin = (color: string, w = 1) => new Stroke({ color, width: w });
 const stylePoly = (fillColor: string, strokeColor = '#333', w = 0.8) =>
   new Style({ fill: new Fill({ color: fillColor }), stroke: strokeThin(strokeColor, w) });
 const styleLine = (color: string, w = 1.8) => new Style({ stroke: strokeThin(color, w) });
 
-const csdStyle = stylePoly('rgba(34,139,34,0.10)', '#2e8b57', 1);
+const csdStyle = stylePoly('rgba(34,139,34,0.22)', '#2e8b57', 2.0); // slightly stronger for visibility
 const ecumeneBase = stylePoly('rgba(50,205,50,0.15)', '#2e8b57', 0.8);
 const fnBase = stylePoly('rgba(148,0,211,0.15)', '#6a0dad', 0.8);
 const facilitiesBase = stylePoly('rgba(31,120,180,0.12)', '#0c3a66', 1.0);
+const buildingsBase = stylePoly('rgba(52,52,255,0.92)', '#c3c9f', 0.8);
 
-const highwaysBase = styleLine('#f1b814', 1.8);
-const railBase = styleLine('#666', 1.8);
+const highwaysBase = styleLine('#f1b814', 2.2);
+const railBase = styleLine('#666', 2.2);
 
 function rampFill(v: number) {
   if (v >= 0.6) return 'rgba(228,26,28,0.45)';
@@ -53,7 +57,14 @@ function lineRiskStyle(feature: any) {
   const vmax = Number(feature.get('v_max') ?? 0);
   const isNew = !!feature.get('is_new');
   const evacuated = !!feature.get('evacuated');
-  const color = evacuated ? '#111' : isNew ? '#ff7f00' : vmax >= 0.6 ? '#e41a1c' : vmax >= 0.2 ? '#f1b814' : '#4daf4a';
+
+  const color =
+    evacuated ? '#111' :
+    isNew ? '#ff7f00' :
+    vmax >= 0.6 ? '#e41a1c' :
+    vmax >= 0.2 ? '#f1b814' :
+    '#4daf4a';
+
   const w = evacuated ? 3.0 : isNew ? 2.6 : 2.0;
   return styleLine(color, w);
 }
@@ -63,74 +74,156 @@ function polygonChoroplethStyle(feature: any) {
   return stylePoly(rampFill(maxProb), '#333', 0.8);
 }
 
-function mvt(url: string, style?: (f: any) => Style) {
-  return new VectorTileLayer({
+function mvt(id: string, url: string, style?: (f: any) => Style) {
+  const source = new VectorTileSource({
+    format: new MVT(),
+    url,
+    // projection: proj3978,
+    // This is the critical piece: OL computes tile extents based on origin/resolutions/tileSize. [1](https://devopscycle.com/blog/the-ultimate-docker-compose-cheat-sheet)[2](https://www.compilenrun.com/docs/devops/docker/docker-compose/docker-compose-yaml/)
+    // tileGrid: tileGrid3978,
+  });
+
+  if (DEBUG_TILE_COUNTS) {
+    source.on('tileloadend', (evt: any) => {
+      const tile = evt.tile;
+      const n = tile?.getFeatures?.()?.length ?? 0;
+      console.debug(`[tileloadend] ${id} features=${n}`);
+    });
+  }
+
+  const layer = new VectorTileLayer({
     properties: { url },
-    source: new VectorTileSource({
-      format: new MVT(),
-      url,
-      projection: proj3978,
-      tileGrid: tileGrid3978,
-    }),
+    source,
     style: style ? (f) => style(f) : undefined,
     declutter: true,
     visible: true,
   });
+
+  layer.set('id', id);
+  layer.setZIndex(10); // ensure overlays above basemap
+  return layer;
 }
 
 export function buildLayerEntries(): LayerEntry[] {
-  // Reference geography
-  const csd = mvt(`${TILESERV}/public.census_subdivisions/{z}/{x}/{y}.pbf?properties=csduid,name,prname`, () => csdStyle);
-  csd.set('id', 'csd');
+  const csd = mvt(
+    'csd',
+    `${TILESERV}/public.census_subdivisions/{z}/{x}/{y}.pbf?properties=csduid,name,prname`,
+    () => csdStyle
+  );
 
-  // Latest-per-theme risk layers (D3/D7)
-  const ecumeneD3 = mvt(`${TILESERV}/risk.v_latest_ecumene_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
-  ecumeneD3.set('id', 'ecumene_d3');
-  const ecumeneD7 = mvt(`${TILESERV}/risk.v_latest_ecumene_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
-  ecumeneD7.set('id', 'ecumene_d7');
+  const ecumeneD3 = mvt(
+    'ecumene_d3',
+    `${TILESERV}/risk.v_latest_ecumene_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    polyRiskStyle
+  );
 
-  const fnD3 = mvt(`${TILESERV}/risk.v_latest_first_nations_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
-  fnD3.set('id', 'fn_d3');
-  const fnD7 = mvt(`${TILESERV}/risk.v_latest_first_nations_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
-  fnD7.set('id', 'fn_d7');
+  const ecumeneD7 = mvt(
+    'ecumene_d7',
+    `${TILESERV}/risk.v_latest_ecumene_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    polyRiskStyle
+  );
 
-  const facilitiesD3 = mvt(`${TILESERV}/risk.v_latest_facilities_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
-  facilitiesD3.set('id', 'fac_d3');
-  const facilitiesD7 = mvt(`${TILESERV}/risk.v_latest_facilities_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, polyRiskStyle);
-  facilitiesD7.set('id', 'fac_d7');
+  const fnD3 = mvt(
+    'fn_d3',
+    `${TILESERV}/risk.v_latest_first_nations_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    polyRiskStyle
+  );
 
-  const highwaysD3 = mvt(`${TILESERV}/risk.v_latest_highways_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, lineRiskStyle);
-  highwaysD3.set('id', 'hw_d3');
-  const highwaysD7 = mvt(`${TILESERV}/risk.v_latest_highways_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, lineRiskStyle);
-  highwaysD7.set('id', 'hw_d7');
+  const fnD7 = mvt(
+    'fn_d7',
+    `${TILESERV}/risk.v_latest_first_nations_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    polyRiskStyle
+  );
 
-  const railD3 = mvt(`${TILESERV}/risk.v_latest_rail_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, lineRiskStyle);
-  railD3.set('id', 'rail_d3');
-  const railD7 = mvt(`${TILESERV}/risk.v_latest_rail_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`, lineRiskStyle);
-  railD7.set('id', 'rail_d7');
+  const facilitiesD3 = mvt(
+    'fac_d3',
+    `${TILESERV}/risk.v_latest_facilities_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    polyRiskStyle
+  );
 
-  // Buildings drill-down is intentionally NOT published as a full-layer here (millions of polygons).
-  // Instead, use the aggregate choropleths below, and add a drill-down mode later.
+  const facilitiesD7 = mvt(
+    'fac_d7',
+    `${TILESERV}/risk.v_latest_facilities_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    polyRiskStyle
+  );
 
-  // Building aggregates
-  const bldCsd = mvt(`${TILESERV}/risk.v_buildings_csd_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`, polygonChoroplethStyle);
-  bldCsd.set('id', 'bld_csd');
-  const bldEcu = mvt(`${TILESERV}/risk.v_buildings_ecumene_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`, polygonChoroplethStyle);
-  bldEcu.set('id', 'bld_ecu');
-  const bldFn = mvt(`${TILESERV}/risk.v_buildings_fn_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`, polygonChoroplethStyle);
-  bldFn.set('id', 'bld_fn');
+  const highwaysD3 = mvt(
+    'hw_d3',
+    `${TILESERV}/risk.v_latest_highways_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    lineRiskStyle
+  );
 
-  // Raw reference layers
-  const ecumeneRaw = mvt(`${TILESERV}/risk.v_features_ecumene_raw/{z}/{x}/{y}.pbf?properties=name`, () => ecumeneBase);
-  ecumeneRaw.set('id', 'ecumene_raw');
-  const fnRaw = mvt(`${TILESERV}/risk.v_features_first_nations_raw/{z}/{x}/{y}.pbf?properties=name`, () => fnBase);
-  fnRaw.set('id', 'first_nations_raw');
-  const highwaysRaw = mvt(`${TILESERV}/risk.v_features_highways_raw/{z}/{x}/{y}.pbf?properties=name`, () => highwaysBase);
-  highwaysRaw.set('id', 'highways_raw');
-  const railRaw = mvt(`${TILESERV}/risk.v_features_rail_raw/{z}/{x}/{y}.pbf?properties=name`, () => railBase);
-  railRaw.set('id', 'rail_raw');
-  const facilitiesRaw = mvt(`${TILESERV}/risk.v_features_facilities_raw/{z}/{x}/{y}.pbf?properties=name`, () => facilitiesBase);
-  facilitiesRaw.set('id', 'facilities_raw');
+  const highwaysD7 = mvt(
+    'hw_d7',
+    `${TILESERV}/risk.v_latest_highways_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    lineRiskStyle
+  );
+
+  const railD3 = mvt(
+    'rail_d3',
+    `${TILESERV}/risk.v_latest_rail_d3/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    lineRiskStyle
+  );
+
+  const railD7 = mvt(
+    'rail_d7',
+    `${TILESERV}/risk.v_latest_rail_d7/{z}/{x}/{y}.pbf?properties=run_date,forecast_day,feature_id,n,v_max,evacuated,is_new,name`,
+    lineRiskStyle
+  );
+
+  const bldCsd = mvt(
+    'bld_csd',
+    `${TILESERV}/risk.v_buildings_csd_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`,
+    polygonChoroplethStyle
+  );
+
+  const bldEcu = mvt(
+    'bld_ecu',
+    `${TILESERV}/risk.v_buildings_ecumene_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`,
+    polygonChoroplethStyle
+  );
+
+  const bldFn = mvt(
+    'bld_fn',
+    `${TILESERV}/risk.v_buildings_fn_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`,
+    polygonChoroplethStyle
+  );
+
+  const ecumeneRaw = mvt(
+    'ecumene_raw',
+    `${TILESERV}/risk.v_features_ecumene_raw/{z}/{x}/{y}.pbf?properties=name`,
+    () => ecumeneBase
+  );
+
+  const buildingsRaw = mvt(
+    'buildings_raw',
+    `${TILESERV}/risk.v_features_buildings_raw/{z}/{x}/{y}.pbf?properties=name`,
+    () => buildingsBase
+  );
+
+  const fnRaw = mvt(
+    'first_nations_raw',
+    `${TILESERV}/risk.v_features_first_nations_raw/{z}/{x}/{y}.pbf?properties=name`,
+    () => fnBase
+  );
+
+  const highwaysRaw = mvt(
+    'highways_raw',
+    `${TILESERV}/risk.v_features_highways_raw/{z}/{x}/{y}.pbf?properties=name`,
+    () => highwaysBase
+  );
+
+  const railRaw = mvt(
+    'rail_raw',
+    `${TILESERV}/risk.v_features_rail_raw/{z}/{x}/{y}.pbf?properties=name`,
+    () => railBase
+  );
+
+  const facilitiesRaw = mvt(
+    'facilities_raw',
+    `${TILESERV}/risk.v_features_facilities_raw/{z}/{x}/{y}.pbf?properties=name`,
+    () => facilitiesBase
+  );
 
   return [
     // Basemap placeholder entry (actual layer inserted in App.tsx)
@@ -159,5 +252,6 @@ export function buildLayerEntries(): LayerEntry[] {
     { id: 'highways_raw', layer: highwaysRaw, visible: false, label: 'Highways (raw)', group: 'Raw Reference', kind: 'overlay' },
     { id: 'rail_raw', layer: railRaw, visible: false, label: 'Rail (raw)', group: 'Raw Reference', kind: 'overlay' },
     { id: 'facilities_raw', layer: facilitiesRaw, visible: false, label: 'Facilities (raw)', group: 'Raw Reference', kind: 'overlay' },
+    { id: 'buildings_raw', layer: buildingsRaw, visible: false, label: 'Buildings (raw)', group: 'Raw Reference', kind: 'overlay' },
   ];
 }

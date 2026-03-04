@@ -1,19 +1,19 @@
-
 // app/iva-map/src/App.tsx
 import { useEffect, useMemo, useRef, useState } from 'react';
-import Map from 'ol/Map';
+import OlMap from 'ol/Map';
 import View from 'ol/View';
+
 import { LayerControl } from './LayerControl';
-import { proj3978, EXTENT_3978 } from './projection';
-import { buildLayerEntries, LayerEntry } from './layers';
+import { proj3978, EXTENT_3978, GRID_RESOLUTIONS_3978 } from './projection';
+import { buildLayerEntries, type LayerEntry } from './layers';
 import { buildCbmtBasemapLayer } from './basemap';
 
 export default function App() {
   const mapDivRef = useRef<HTMLDivElement | null>(null);
-  const mapRef = useRef<Map | null>(null);
+  const mapRef = useRef<OlMap | null>(null);
+
   const [entries, setEntries] = useState<LayerEntry[]>(() => buildLayerEntries());
 
-  // Build map once
   useEffect(() => {
     if (!mapDivRef.current) return;
 
@@ -22,34 +22,70 @@ export default function App() {
       (EXTENT_3978[1] + EXTENT_3978[3]) / 2,
     ];
 
-    const map = new Map({
+    const map = new OlMap({
       target: mapDivRef.current,
       view: new View({
         projection: proj3978,
         center: center3978,
-        zoom: 3,
         extent: EXTENT_3978,
+
+        // Critical: lock the view to the ESRI/CBMT LOD ladder.
+        // OL tile math is driven by origin+resolutions+tileSize on the TileGrid. [1](https://devopscycle.com/blog/the-ultimate-docker-compose-cheat-sheet)[2](https://www.compilenrun.com/docs/devops/docker/docker-compose/docker-compose-yaml/)
+        resolutions: GRID_RESOLUTIONS_3978,
+        constrainResolution: true,
+
+        zoom: 4, // slightly closer than 3 to make outlines more apparent
+        minZoom: 0,
+        maxZoom: GRID_RESOLUTIONS_3978.length - 1,
       }),
       layers: entries.map((e) => {
         e.layer.setVisible(e.visible);
         e.layer.set('id', e.id);
+
+        // Ensure overlays are above basemap by default.
+        // (Basemap will be forced to zIndex 0 when inserted.)
+        if (e.kind === 'overlay') {
+          (e.layer as any).setZIndex?.(10);
+        } else {
+          (e.layer as any).setZIndex?.(0);
+        }
         return e.layer;
       }),
     });
 
     mapRef.current = map;
 
+    // Handy debug handle
+    (window as any).__iva_map = map;
+
     // Add CBMT basemap at index 0 so overlays draw on top.
     buildCbmtBasemapLayer()
       .then((baseLayer) => {
         baseLayer.set('id', 'cbmt');
         baseLayer.setVisible(true);
+        baseLayer.setZIndex?.(0);
+
         map.getLayers().insertAt(0, baseLayer);
 
+        // Ensure existing overlays stay above
+        map.getLayers()
+          .getArray()
+          .forEach((l) => {
+            if (l.get('id') !== 'cbmt') (l as any).setZIndex?.(10);
+          });
+
+        // Keep LayerControl entries list in sync
         setEntries((prev) => {
           const filtered = prev.filter((e) => e.id !== 'cbmt');
           return [
-            { id: 'cbmt', kind: 'base', group: 'Basemap', layer: baseLayer as any, visible: true, label: 'CBMT (3978)' },
+            {
+              id: 'cbmt',
+              kind: 'base',
+              group: 'Basemap',
+              layer: baseLayer as any,
+              visible: true,
+              label: 'CBMT (3978)',
+            },
             ...filtered,
           ];
         });
@@ -59,6 +95,7 @@ export default function App() {
     return () => {
       map.setTarget(undefined);
       mapRef.current = null;
+      delete (window as any).__iva_map;
     };
   }, []);
 
@@ -66,8 +103,13 @@ export default function App() {
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
+
     for (const e of entries) {
-      const match = map.getLayers().getArray().find((l) => l.get('id') === e.id);
+      const match = map
+        .getLayers()
+        .getArray()
+        .find((l) => l.get('id') === e.id);
+
       if (match) match.setVisible(e.visible);
     }
   }, [entries]);
@@ -76,6 +118,7 @@ export default function App() {
     () => entries.filter((e) => e.kind === 'base').map((e) => ({ id: e.id, label: e.label, visible: e.visible })),
     [entries]
   );
+
   const selectedBaseId = useMemo(() => {
     const active = entries.find((e) => e.kind === 'base' && e.visible);
     return active?.id ?? null;
@@ -83,13 +126,14 @@ export default function App() {
 
   const overlayGroups = useMemo(() => {
     const groups = new Map<string, { title: string; layers: { id: string; label: string; visible: boolean }[] }>();
+
     for (const e of entries) {
       if (e.kind !== 'overlay') continue;
       const key = e.group ?? 'Other';
       if (!groups.has(key)) groups.set(key, { title: key, layers: [] });
       groups.get(key)!.layers.push({ id: e.id, label: e.label, visible: e.visible });
     }
-    // Sort groups and layers for stable UI
+
     return Array.from(groups.values())
       .map((g) => ({
         title: g.title,
@@ -99,13 +143,7 @@ export default function App() {
   }, [entries]);
 
   const onSelectBase = (id: string) => {
-    setEntries((prev) =>
-      prev.map((e) =>
-        e.kind === 'base'
-          ? { ...e, visible: e.id === id }
-          : e
-      )
-    );
+    setEntries((prev) => prev.map((e) => (e.kind === 'base' ? { ...e, visible: e.id === id } : e)));
   };
 
   const onToggleOverlay = (id: string, visible: boolean) => {

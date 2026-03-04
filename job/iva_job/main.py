@@ -26,7 +26,7 @@ from pathlib import Path
 import os
 import logging
 import json
-
+import requests
 import numpy as np
 import rasterio
 from rasterio.mask import mask
@@ -53,8 +53,6 @@ def _fetch_evac_buffers(cur, buffer_m: float = 2500.0):
     url = os.getenv('EVAC_WFS_URL', '').strip()
     if not url:
         return None
-
-    import requests
 
     log.info('Fetching evacuations from EVAC_WFS_URL')
     gj = requests.get(url, timeout=60).json()

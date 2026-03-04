@@ -389,7 +389,7 @@ BEGIN
     INSERT INTO risk.features (feature_set_id, source_pk, name, attrs, geom)
     SELECT %s::smallint AS feature_set_id,
            COALESCE(j->>'SOURCE_PK', j->>'CSDUID', j->>'OBJECTID', j->>'ID', j->>'fid', md5(ST_AsEWKB(geom))) AS source_pk,
-           COALESCE(j->>'NAME', j->>'name', j->>'CSDNAME', j->>'ENG_NAME', j->>'FULLNAME', j->>'FIRST_NATION_NAME') AS name,
+           COALESCE(j->>'NAME', j->>'name', j->>'CSDNAME', j->>'ENG_NAME', j->>'OSM_NAME', j->>'FULLNAME', j->>'FIRST_NATION_NAME') AS name,
            (j - 'geom' - 'geometry')::jsonb AS attrs,
            CASE
              WHEN ST_SRID(geom) = %s THEN
@@ -460,7 +460,77 @@ EXCEPTION WHEN undefined_table THEN
 END$$;
 
 -- ------------------------------------------------------------
--- Per-set RAW views (nice endpoints for tiles/feature services)
+-- Buildings import: automatically ingest any FDW table whose name
+-- matches "*_structures_en" into the buildings feature set.  This
+-- mirrors the behaviour of the Python loader and keeps the DDL self-
+-- contained.  If there are no such tables the loop simply does nothing.
+-- You can still populate buildings by running the loader script instead.
+-- ------------------------------------------------------------
+DO $$
+DECLARE
+  tbl text;
+BEGIN
+  FOR tbl IN
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema='fdw' AND table_name LIKE '%_structures_en'
+  LOOP
+    EXECUTE format('PERFORM risk.ingest_features_from_fdw(%L::regclass, ''buildings'');', 'fdw.'||tbl);
+  END LOOP;
+EXCEPTION WHEN undefined_table THEN
+  RAISE NOTICE 'no building FDW tables found; run loader or fix layer names';
+END$$;
+
+DO $$ BEGIN
+  PERFORM risk.ingest_features_from_fdw('fdw.buildings_v2'::regclass,    'buildings');
+EXCEPTION WHEN undefined_table THEN
+  RAISE NOTICE 'FDW table for buildings not found. Adjust fdw.* layer name.';
+END$$;
+
+-- -------------------------------------------------------------- Buildings import (dynamic, mirrors iva_job/loaders.py glob)
+-- ------------------------------------------------------------
+DO $$
+DECLARE
+    layer text;
+    fname text;
+    rows bigint;
+    layers text[] := ARRAY[
+      'ab_structures_en','bc_structures_en','mb_structures_en','nb_structures_en',
+      'nl_structures_en','ns_structures_en','nt_structures_en','nu_structures_en',
+      'on_structures_en','pe_structures_en','qc_structures_en','sk_structures_en','yk_structures_en'
+    ];
+BEGIN
+    FOR layer IN SELECT unnest(layers) LOOP
+        fname := layer || '.gpkg';
+        RAISE NOTICE 'building import: attempting file % (layer %)', fname, layer;
+        BEGIN
+            EXECUTE format(
+              'CREATE SERVER IF NOT EXISTS fdw_%1$s FOREIGN DATA WRAPPER ogr_fdw
+               OPTIONS (datasource %L, format ''GPKG'');',
+              layer, '/data/'||fname
+            );
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'could not create FDW server for %: %', fname, SQLERRM;
+            CONTINUE;
+        END;
+        BEGIN
+            EXECUTE format('IMPORT FOREIGN SCHEMA ogr_all FROM SERVER fdw_%1$s INTO fdw;', layer);
+        EXCEPTION WHEN others THEN
+            RAISE NOTICE 'could not import foreign schema for %: %', layer, SQLERRM;
+            CONTINUE;
+        END;
+        BEGIN
+            rows := risk.ingest_features_from_fdw('fdw.'||layer::regclass, 'buildings');
+            RAISE NOTICE '  -> % rows inserted/updated into risk.features', rows;
+        EXCEPTION WHEN undefined_table THEN
+            RAISE NOTICE 'FDW table for % not found', layer;
+        WHEN others THEN
+            RAISE NOTICE 'error ingesting from %: %', layer, SQLERRM;
+        END;
+    END LOOP;
+END$$;
+
+-- -------------------------------------------------------------- Per-set RAW views (nice endpoints for tiles/feature services)
 -- ------------------------------------------------------------
 
 CREATE OR REPLACE VIEW risk.v_features_ecumene_raw AS
@@ -494,6 +564,15 @@ SELECT
 FROM risk.v_features_raw WHERE feature_set_code='facilities';
 
 -- ------------------------------------------------------------
+-- Buildings raw view (per‑feature layer, populated by loader or FDW import)
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW risk.v_features_buildings_raw AS
+SELECT
+  id, feature_set_code, source_pk, name, attrs, created_at,
+  ST_Multi(ST_Transform(geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+FROM risk.v_features_raw WHERE feature_set_code='buildings';
+
+-- ------------------------------------------------------------
 -- Grants / defaults
 -- ------------------------------------------------------------
 GRANT USAGE ON SCHEMA risk TO iva_job, iva_app;
@@ -525,7 +604,8 @@ GRANT SELECT ON
   risk.v_features_first_nations_raw,
   risk.v_features_highways_raw,
   risk.v_features_rail_raw,
-  risk.v_features_facilities_raw
+  risk.v_features_facilities_raw,
+  risk.v_features_buildings_raw
 TO iva_app;
 
 -- Optional helper to refresh MVs

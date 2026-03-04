@@ -18,6 +18,7 @@ services:
       - pgdata:/var/lib/postgresql
       # Make ddl.sql visible; init service will run it via psql
       - ./db/ddl.sql:/ddl/ddl.sql:ro
+      - ./db/ddl_patch_views.sql:/ddl/ddl_patch_views.sql:ro
       # Mount your data so ogr_fdw in ddl.sql can read gpkg files
       - ./data:/data:ro
     healthcheck:
@@ -40,13 +41,17 @@ services:
       - APP_PGPASSWORD=${APP_PGPASSWORD}
     volumes:
       - ./db/ddl.sql:/ddl/ddl.sql:ro
+      - ./db/ddl_patch_views.sql:/ddl/ddl_patch_views.sql:ro
     entrypoint:
       - bash
-      - -lc
-      - >
-        psql -h postgis -U iva_job -d impacted_values
-        -v app_pass="${APP_PGPASSWORD}" -v job_pass="${PGPASSWORD}"
-        -f /ddl/ddl.sql
+      - -c
+      - |
+        psql -h postgis -U iva_job -d impacted_values \
+          -v app_pass="${APP_PGPASSWORD}" -v job_pass="${PGPASSWORD}" \
+          -f /ddl/ddl.sql && \
+        psql -h postgis -U iva_job -d impacted_values \
+          -v app_pass="${APP_PGPASSWORD}" -v job_pass="${PGPASSWORD}" \
+          -f /ddl/ddl_patch_views.sql
     restart: "no"
     networks:
       - iva_net
@@ -73,15 +78,10 @@ services:
     image: pramsey/pg_tileserv:latest
     container_name: pg_tileserv
     environment:
-      - DATABASE_URL=postgresql://${APP_PGUSER:-iva_app}:${APP_PGPASSWORD}@pgbouncer:5432/impacted_values?sslmode=disable
-      - LISTEN_ADDR=0.0.0.0
-      - PORT=7800
-      - TS_COORDINATESYSTEM_SRID=3978
-      - TS_COORDINATESYSTEM_XMIN=${IVA_3978_XMIN}
-      - TS_COORDINATESYSTEM_YMIN=${IVA_3978_YMIN}
-      - TS_COORDINATESYSTEM_XMAX=${IVA_3978_XMAX}
-      - TS_COORDINATESYSTEM_YMAX=${IVA_3978_YMAX}
-
+      - DATABASE_URL=postgresql://${APP_PGUSER:-iva_app}:${APP_PGPASSWORD}@postgis:5432/impacted_values?sslmode=disable
+      - TS_DEBUG=true    
+    volumes:
+      - ./config/pg_tileserv.toml:/config/pg_tileserv.toml:ro
     ports:
       - "7800:7800"
     depends_on:
@@ -114,13 +114,22 @@ services:
       context: ./job
     container_name: iva-job
     env_file: [ .env ]
+    environment:
+      - FEATURE_SET_CODES=ecumene,first_nations,highways,rail,facilities,buildings
+      - PGPASSWORD=${PGPASSWORD}
+      - PGHOST=postgis
+      - PGPORT=5432
+      - PGUSER=iva_job
+      - PGDATABASE=impacted_values
     depends_on:
       postgis:
         condition: service_healthy
       initdb:
         condition: service_completed_successfully
-    restart: unless-stopped
-    command: ["python", "-m", "iva_job.main"]
+    restart: on-failure
+    command: ["bash","-c","sleep 10 && python -m iva_job.loaders /data && python -m iva_job.main"]
+    volumes:
+      - ./data:/data:ro
     networks:
       - iva_net
 

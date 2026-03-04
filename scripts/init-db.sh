@@ -6,6 +6,7 @@ CONTAINER_NAME="postgis"
 DB_NAME="impacted_values"
 WRITER_USER="iva_job"
 DDL_PATH_IN_CONTAINER="/ddl/ddl.sql"
+DDL_PATCH_IN_CONTAINER='/ddl/ddl_patch_views.sql'
 WAIT_SECS=60
 
 # Load .env (APP_PGPASSWORD, PGPASSWORD)
@@ -36,3 +37,9 @@ podman exec -i "${CONTAINER_NAME}" psql -U "${WRITER_USER}" -d "${DB_NAME}" \
   -v job_pass="${PGPASSWORD}" \
   -f "${DDL_PATH_IN_CONTAINER}"
 echo "DDL applied."
+echo "Applying DDL patch..."
+podman exec -i "${CONTAINER_NAME}" psql -U "${WRITER_USER}" -d "${DB_NAME}" \
+  -v app_pass="${APP_PGPASSWORD}" \
+  -v job_pass="${PGPASSWORD}" \
+  -f "${DDL_PATH_IN_CONTAINER}"
+echo "DDL patch applied."

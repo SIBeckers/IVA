@@ -64,7 +64,6 @@ def _list_container(container_base: str, sas_query: str, prefix: str = '', delim
     r.raise_for_status()
     root = ET.fromstring(r.text)
 
-    ns = ''
     # Extract CommonPrefixes
     prefixes = []
     for cp in root.findall('.//CommonPrefixes'):
