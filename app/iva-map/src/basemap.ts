@@ -41,6 +41,7 @@ export async function buildCbmtBasemapLayer() {
 
   const layer = new VectorTileLayer({
     declutter: true,
+    overlaps: false,
     source: new VectorTileSource({
       format: new MVT(),
       projection: proj3978,

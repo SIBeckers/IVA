@@ -8,3 +8,4 @@ pyproj
 requests
 pyogrio
 fiona
+azure-storage-blob

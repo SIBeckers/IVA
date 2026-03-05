@@ -3,7 +3,7 @@
 -- IVA Database DDL (Full Replacement)
 -- Adds: SQL-only ingestion of CSD 2025 & reference GeoPackages using ogr_fdw
 --       Raw publishable views per feature set + latest intersection views
--- SRID: EPSG:3979
+-- SRID: EPSG:3978
 -- =====================================================================
 
 -- ------------------------------------------------------------
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS risk.features (
   source_pk text NOT NULL,
   name text,
   attrs jsonb,
-  geom geometry(Geometry,3979) NOT NULL,
+  geom geometry(Geometry,3978) NOT NULL,
   created_at timestamptz DEFAULT now(),
   UNIQUE (feature_set_id, source_pk)
 );
@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS risk.runs (
   run_date date NOT NULL,
   forecast_day integer NOT NULL CHECK (forecast_day IN (3,7)),
   wmstime date NOT NULL,
-  srs integer NOT NULL DEFAULT 3979,
+  srs integer NOT NULL DEFAULT 3978,
   res_m integer NOT NULL DEFAULT 100,
   blob_uris text[] NOT NULL,
   created_at timestamptz DEFAULT now(),
@@ -192,7 +192,7 @@ CREATE TABLE IF NOT EXISTS public.census_subdivisions_2025 (
   csduid text PRIMARY KEY,
   name   text,
   prname text,
-  geom   geometry(MultiPolygon, 3979)
+  geom   geometry(MultiPolygon, 3978)
 );
 CREATE INDEX IF NOT EXISTS csd_2025_geom_gix ON public.census_subdivisions_2025 USING GIST (geom);
 
@@ -227,7 +227,7 @@ BEGIN
     src_srid := 3347;
   END IF;
 
-  -- Upsert into canonical table in EPSG:3979 with POLYGON->MULTIPOLYGON normalization
+  -- Upsert into canonical table in EPSG:3978 with POLYGON->MULTIPOLYGON normalization
   
   EXECUTE format($q$
     INSERT INTO public.census_subdivisions_2025 (csduid, name, prname, geom)
@@ -236,11 +236,11 @@ BEGIN
       t.csdname::text AS name,
       t.prname::text  AS prname,
       CASE
-        WHEN %1$s = 3979 THEN
+        WHEN %1$s = 3978 THEN
           CASE WHEN GeometryType(t.geom) LIKE 'POLYGON%%' THEN ST_Multi(t.geom) ELSE t.geom END
         ELSE
-          CASE WHEN GeometryType(t.geom) LIKE 'POLYGON%%' THEN ST_Multi(ST_Transform(t.geom,3979))
-              ELSE ST_Transform(t.geom,3979) END
+          CASE WHEN GeometryType(t.geom) LIKE 'POLYGON%%' THEN ST_Multi(ST_Transform(t.geom,3978))
+              ELSE ST_Transform(t.geom,3978) END
       END AS geom
     FROM %2$s AS t
     WHERE t.geom IS NOT NULL
@@ -372,7 +372,7 @@ IMPORT FOREIGN SCHEMA ogr_all FROM SERVER fdw_railways INTO fdw;
 CREATE OR REPLACE FUNCTION risk.ingest_features_from_fdw(
   src regclass,
   feature_set_code text,
-  srid int DEFAULT 3979
+  srid int DEFAULT 3978
 ) RETURNS bigint
 LANGUAGE plpgsql AS $$
 DECLARE

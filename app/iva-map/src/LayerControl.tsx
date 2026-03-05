@@ -76,7 +76,7 @@ export function LayerControl({
       <style>{`
         .layer-control {
           position: absolute;
-          top: 8px;
+          top: 50px;
           left: 8px;
           z-index: 1000;
           background: rgba(255,255,255,.92);

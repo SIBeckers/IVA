@@ -87,3 +87,5 @@ export const tileGrid3978 = new TileGrid({
   resolutions: GRID_RESOLUTIONS_3978,
   tileSize: TILE_SIZE_3978,
 });
+
+export const proj3857 = getProjection('EPSG:3857')!;

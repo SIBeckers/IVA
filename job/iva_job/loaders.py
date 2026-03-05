@@ -21,7 +21,7 @@ except Exception:  # pragma: no cover
     shapely_prep = None
 
 
-EPSG = 3979
+EPSG = 3978
 
 log = logging.getLogger("iva.loaders")
 logging.basicConfig(
@@ -101,13 +101,17 @@ def upsert_features(
     set_code: str,
     pk_col: str,
     name_col: Optional[str] = None,
-    commit_every: int = 5000,
+    commit_every: Optional[int] = None,
 ) -> None:
     """
     Upsert features into risk.features for a given feature set code.
     - attrs written as JSON (Json wrapper).
     - geometry inserted via ST_GeomFromWKB with SRID set to EPSG.
     """
+    if commit_every is None:
+        commit_every = int(os.getenv("IVA_CHUNK_SIZE", "5000"))
+
+
     if gdf is None or len(gdf) == 0:
         log.info(f"no features to upsert for set {set_code}")
         return

@@ -1,258 +1,609 @@
-
 # job/iva_job/firestarr.py
-# Strict parity mosaics: max mosaic, nearest resampling, exact 100m grid.
-# Also supports "latest folder" discovery to mimic justTheIntersection.R.
+"""
+FireSTARR GeoTIFF retrieval + reprojection + mosaic, using Azure Blob Storage Python SDK.
+
+Blob layouts (searched in this order):
+ 1) archive/YYYYMMDDHHMM/ -> already-mosaiced GeoTIFF per forecast day
+    filenames: firestarr_YYYYMMDDHHMM_day_XX_YYYYMMDD.tif
+
+ 2) M3 tiles -> multiple tiles to mosaic. Two common roots exist:
+    A) firestarr/m3_YYYYMMDDHHMM/YYYYMMDD/YYN_XXXXX.tif
+    B) firestarr/firestarr/m3_YYYYMMDDHHMM/YYYYMMDD/YYN_XXXXX.tif
+
+Selection rules:
+ - Choose run folder by exact run_date (YYYYMMDD), selecting the latest HHMM within that date.
+ - NO fallback to earlier dates.
+ - For archive: pick exactly the file firestarr_{run_ts}_day_{DD}_{forecast_ymd}.tif
+   where forecast_ymd = run_date + (day-1).
+ - For m3: pick forecast folder forecast_ymd = run_date + (day-1), list all *.tif inside.
+ - Reproject to EPSG:3978 @ 100m using nearest (WarpedVRT), then mosaic with rasterio.merge(method="max").
+
+Auth:
+ - FIRESTARR_BLOB_URL must be a *container URL*, ideally including SAS token.
+ - If FIRESTARR_BLOB_URL has no query string, we will append AZURE_SAS_TOKEN (if set).
+
+SDK:
+ - Uses azure-storage-blob ContainerClient.from_container_url(). [1](https://github.com/Azure/azure-storage-python)
+ - Uses walk_blobs(delimiter="/") to traverse virtual folders/prefixes. [3](https://041gc-my.sharepoint.com/personal/justin_beckers_nrcan-rncan_gc_ca/Documents/Microsoft%20Copilot%20Chat%20Files/firestarr.py)
+
+Debug:
+ - Set FIRESTARR_LOG_LEVEL=DEBUG or pass --log-level DEBUG to see searched prefixes and results.
+"""
+
+from __future__ import annotations
 
 import os
-import tempfile
-from datetime import date
-from typing import List, Tuple, Optional
+import re
+import time
 import logging
+import tempfile
+from datetime import date, timedelta
 from pathlib import Path
-from urllib.parse import urlparse, urlencode, parse_qsl
-import xml.etree.ElementTree as ET
+from typing import Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
-import requests
-import numpy as np
 import rasterio
 from rasterio.merge import merge
-from rasterio.warp import transform_bounds, reproject, Resampling
-from rasterio.transform import from_origin
+from rasterio.vrt import WarpedVRT
+from rasterio.warp import Resampling
 
-log = logging.getLogger('iva.firestarr')
-logging.basicConfig(level=logging.INFO)
+# Azure SDK
+from azure.storage.blob import ContainerClient
+from azure.storage.blob import BlobPrefix  # returned by walk_blobs when delimiter is used
+
+log = logging.getLogger("iva.firestarr")
+
+_TS_12_RE = re.compile(r"(\d{12})")  # YYYYMMDDHHMM
+
+
+# -----------------------
+# Logging
+# -----------------------
+def _setup_logging(force: bool = False) -> None:
+    lvl = os.getenv("FIRESTARR_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")).upper().strip()
+    level = getattr(logging, lvl, logging.INFO)
+
+    root = logging.getLogger()
+    if force:
+        for h in list(root.handlers):
+            root.removeHandler(h)
+
+    if not root.handlers or force:
+        logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
+    else:
+        root.setLevel(level)
+
+    log.debug("FireSTARR logging initialized: level=%s", lvl)
+
+
+def _sample(items: Sequence[str], n: int = 10) -> List[str]:
+    items = list(items or [])
+    if len(items) <= n:
+        return items
+    return items[:n] + ["..."]
+
+
+_setup_logging(force=False)
+
+
+# -----------------------
+# Env helpers
+# -----------------------
+def _env(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return v if v is not None and v != "" else default
 
 
 def _ymd(d: date) -> str:
-    return d.strftime('%Y%m%d')
+    return d.strftime("%Y%m%d")
 
 
-def _split_base_and_sas(container_url: str) -> Tuple[str, str]:
-    """Split FIRESTARR_BLOB_URL into base container URL and SAS token (if embedded)."""
-    # FIRESTARR_BLOB_URL may include a sas query, but usually it doesn't.
+def _ensure_container_url_has_sas(container_url: str) -> str:
+    """
+    If FIRESTARR_BLOB_URL doesn't include a query string, append AZURE_SAS_TOKEN (if present).
+    ContainerClient.from_container_url() supports full container URI construction. [1](https://github.com/Azure/azure-storage-python)
+    """
     p = urlparse(container_url)
-    base = f"{p.scheme}://{p.netloc}{p.path}".rstrip('/')
-    sas = p.query
-    return base, sas
+    if p.query:
+        return container_url
+
+    sas = _env("AZURE_SAS_TOKEN", "").lstrip("?")
+    if not sas:
+        # SDK will still work for public containers; for private, this will fail with auth.
+        return container_url
+
+    # Merge existing (none) with sas
+    q = dict(parse_qsl(p.query, keep_blank_values=True))
+    q_sas = dict(parse_qsl(sas, keep_blank_values=True))
+    q.update(q_sas)
+    new_p = p._replace(query=urlencode(q))
+    return urlunparse(new_p)
 
 
-def _sas_join(base: str, sas: str, extra: dict) -> str:
-    """Attach SAS query parameters plus extra query params."""
-    base_q = dict(parse_qsl(sas, keep_blank_values=True)) if sas else {}
-    base_q.update(extra)
-    return base + ('?' + urlencode(base_q) if base_q else '')
-
-
-def _list_container(container_base: str, sas_query: str, prefix: str = '', delimiter: str = '/', max_results: int = 5000) -> Tuple[List[str], List[str]]:
-    """List Azure Blob container using REST API.
-
-    Returns (prefixes, blobs).
+def _container_client() -> ContainerClient:
     """
-    # Azure list blobs: restype=container&comp=list&prefix=...&delimiter=/
-    url = _sas_join(
-        container_base,
-        sas_query,
-        {
-            'restype': 'container',
-            'comp': 'list',
-            'prefix': prefix,
-            'delimiter': delimiter,
-            'maxresults': str(max_results),
-        },
+    Build ContainerClient from the container URL.
+    Microsoft docs explicitly recommend from_container_url when you have the full container URI. [1](https://github.com/Azure/azure-storage-python)
+    """
+    raw = _env("FIRESTARR_BLOB_URL", "https://sawipsprodca.blob.core.windows.net/firestarr").rstrip("/")
+    url = _ensure_container_url_has_sas(raw)
+
+    # Note: credential is optional if SAS token is already in the URL. [1](https://github.com/Azure/azure-storage-python)
+    cc = ContainerClient.from_container_url(url)
+    if log.isEnabledFor(logging.DEBUG):
+        # Don’t print SAS values; just indicate presence.
+        has_q = bool(urlparse(url).query)
+        log.debug("ContainerClient created: url=%s (has_sas=%s)", cc.url, has_q)
+    return cc
+
+
+# -----------------------
+# Azure "folder" traversal helpers
+# -----------------------
+def _extract_ts_yyyymmddhhmm(path: str) -> Optional[str]:
+    m = _TS_12_RE.search(path)
+    return m.group(1) if m else None
+
+
+def _pick_latest_run_prefix_for_date(prefixes: Sequence[str], run_ymd: str) -> Optional[str]:
+    matches: List[str] = []
+    for p in prefixes:
+        ts = _extract_ts_yyyymmddhhmm(p)
+        if ts and ts.startswith(run_ymd):
+            matches.append(p)
+    return sorted(matches)[-1] if matches else None
+
+
+def _list_child_prefixes(cc: ContainerClient, base_prefix: str) -> List[str]:
+    """
+    Return immediate child prefixes (virtual folders) under base_prefix using delimiter="/".
+    walk_blobs(delimiter="/") yields BlobPrefix entries for virtual directories. [3](https://041gc-my.sharepoint.com/personal/justin_beckers_nrcan-rncan_gc_ca/Documents/Microsoft%20Copilot%20Chat%20Files/firestarr.py)
+    """
+    base_prefix = base_prefix.strip("/") + "/"
+    out: List[str] = []
+
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("LIST prefixes under: %s", base_prefix)
+
+    for item in cc.walk_blobs(name_starts_with=base_prefix, delimiter="/"):
+        if isinstance(item, BlobPrefix):
+            out.append(item.name)
+
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("LIST result: %d prefixes sample=%s", len(out), _sample(out))
+
+    return out
+
+
+def _list_blobs_flat(cc: ContainerClient, prefix: str) -> List[str]:
+    """
+    Flat blob listing by prefix.
+    Azure SDK supports prefix filtering as the standard way to filter blob names. [5](https://learn.microsoft.com/en-us/python/api/overview/azure/storage-blob-readme?view=azure-python)
+    """
+    prefix = prefix.lstrip("/")
+    names: List[str] = []
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("LIST blobs under prefix: %s", prefix)
+
+    for b in cc.list_blobs(name_starts_with=prefix):
+        names.append(b.name)
+
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("LIST blobs result: %d blobs sample=%s", len(names), _sample(names))
+
+    return names
+
+
+# -----------------------
+# Discovery
+# -----------------------
+def _discover_archive_blob(run_date: date, horizon: int) -> Optional[str]:
+    """
+    archive/YYYYMMDDHHMM/ contains GeoTIFFs named:
+      firestarr_YYYYMMDDHHMM_day_XX_YYYYMMDD.tif
+
+    We:
+      - choose latest run folder for run_date (YYYYMMDD)
+      - compute forecast_ymd = run_date + (horizon-1)
+      - check existence of the expected file
+    """
+    cc = _container_client()
+
+    archive_prefix = _env("FIRESTARR_ARCHIVE_PREFIX", "archive").strip("/").strip()
+    archive_prefix = archive_prefix + "/"
+    run_ymd = _ymd(run_date)
+    log.debug("Discover archive: base=%s run_date=%s horizon=%s", archive_prefix, run_date.isoformat(), horizon)
+
+    run_prefixes = _list_child_prefixes(cc, archive_prefix)
+    run_prefix = _pick_latest_run_prefix_for_date(run_prefixes, run_ymd)
+    if not run_prefix:
+        log.debug("Archive: no run prefix matched run_ymd=%s under %s", run_ymd, archive_prefix)
+        return None
+
+    run_ts = _extract_ts_yyyymmddhhmm(run_prefix)
+    if not run_ts:
+        raise RuntimeError(f"Archive run prefix did not contain YYYYMMDDHHMM: {run_prefix}")
+
+    forecast_ymd = _ymd(run_date + timedelta(days=int(horizon) - 1))
+    expected_name = f"firestarr_{run_ts}_day_{int(horizon):02d}_{forecast_ymd}.tif"
+    expected_blob = f"{run_prefix}{expected_name}"
+
+    log.debug(
+        "Archive: picked run_prefix=%s run_ts=%s forecast_ymd=%s expected=%s",
+        run_prefix,
+        run_ts,
+        forecast_ymd,
+        expected_blob,
     )
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    root = ET.fromstring(r.text)
 
-    # Extract CommonPrefixes
-    prefixes = []
-    for cp in root.findall('.//CommonPrefixes'):
-        name_el = cp.find('Name')
-        if name_el is not None and name_el.text:
-            prefixes.append(name_el.text)
-
-    blobs = []
-    for b in root.findall('.//Blobs/Blob'):
-        name_el = b.find('Name')
-        if name_el is not None and name_el.text:
-            blobs.append(name_el.text)
-
-    return prefixes, blobs
+    # Existence check via get_blob_properties (fast and explicit)
+    try:
+        cc.get_blob_client(expected_blob).get_blob_properties()
+        return expected_blob
+    except Exception as e:
+        # If naming changes, provide candidates by listing .tif within the run prefix.
+        log.debug("Archive: expected blob not found (%s). Listing candidates...", e)
+        blobs = _list_blobs_flat(cc, run_prefix)
+        tifs = [b for b in blobs if b.lower().endswith(".tif")]
+        raise RuntimeError(
+            f"Expected archive file not found: {expected_blob}. Available tifs: {[Path(t).name for t in tifs]}"
+        ) from e
 
 
-def discover_latest_tiles(run_date: date, horizon: int) -> List[str]:
-    """Mimic the R logic:
-
-    - list 'firestarr/' immediate prefixes
-    - pick the latest prefix
-    - within it, find a sub-prefix containing the target date string (run_date + horizon - 1)
-    - list tif blobs under that prefix
-
-    Returns: list of blob names (paths) within the container.
+def _m3_root_candidates() -> List[str]:
     """
-    container_url = os.getenv('FIRESTARR_BLOB_URL', '').rstrip('/')
-    if not container_url:
-        raise ValueError('FIRESTARR_BLOB_URL is not set')
+    Determine which M3 roots to try.
 
-    # SAS can be provided separately or embedded
-    sas_env = os.getenv('AZURE_SAS_TOKEN', '')
-    base, sas_in_url = _split_base_and_sas(container_url)
-    sas_query = sas_in_url or sas_env.lstrip('?')
-
-    root_prefix = os.getenv('FIRESTARR_ROOT_PREFIX', 'firestarr').strip('/').strip()
-    root_prefix = root_prefix + '/'
-
-    # 1) list root prefixes
-    prefixes, _ = _list_container(base, sas_query, prefix=root_prefix, delimiter='/')
-    if not prefixes:
-        raise RuntimeError(f'No prefixes found under {root_prefix}')
-
-    # R uses tail(list_blobs(...), n=1). We approximate with lexicographic max.
-    latest = sorted(prefixes)[-1]
-    log.info(f'Discovered latest run prefix: {latest}')
-
-    # 2) list immediate prefixes under latest
-    sub_prefixes, _ = _list_container(base, sas_query, prefix=latest, delimiter='/')
-
-    target_date = _ymd(run_date + (horizon - 1) * (run_date - run_date))  # placeholder to keep typing happy
-    # compute target date string as in R: runDate + (day-1)
-    from datetime import timedelta
-    target_date = (run_date + timedelta(days=horizon - 1)).strftime('%Y%m%d')
-
-    # Find a subprefix containing target date
-    candidates = [p for p in sub_prefixes if target_date in p]
-    if not candidates:
-        # fallback: search blobs names if prefixes missing
-        _, blobs = _list_container(base, sas_query, prefix=latest, delimiter='')
-        candidates = sorted(set([b.rsplit('/', 1)[0] + '/' for b in blobs if target_date in b]))
-
-    if not candidates:
-        raise RuntimeError(f'No sub-prefix found under {latest} containing {target_date}')
-
-    day_prefix = sorted(candidates)[-1]
-    log.info(f'Discovered day prefix: {day_prefix}')
-
-    # 3) list tif blobs under day_prefix
-    _, blobs = _list_container(base, sas_query, prefix=day_prefix, delimiter='')
-    tifs = [b for b in blobs if b.lower().endswith('.tif')]
-    if not tifs:
-        raise RuntimeError(f'No .tif blobs found under {day_prefix}')
-
-    return tifs
-
-
-def build_blob_urls(run_date: date, horizon: int, prefix: str, grid: List[Tuple[int, int]]) -> List[str]:
-    """Build or discover blob URLs.
-
-    If FIRESTARR_DISCOVER_LATEST=1, uses Azure listing to mimic R workflow.
-    Otherwise uses TILE_TEMPLATE + grid.
+    Override with:
+      - FIRESTARR_M3_PREFIXES="firestarr,firestarr/firestarr"
+    or:
+      - FIRESTARR_M3_PREFIX="firestarr"
     """
-    container_url = os.getenv('FIRESTARR_BLOB_URL', '').rstrip('/')
-    if not container_url:
-        raise ValueError('FIRESTARR_BLOB_URL is not set')
+    multi = _env("FIRESTARR_M3_PREFIXES", "").strip()
+    single = _env("FIRESTARR_M3_PREFIX", "").strip()
 
-    base, sas_in_url = _split_base_and_sas(container_url)
-    sas_env = os.getenv('AZURE_SAS_TOKEN', '')
-    sas_query = sas_in_url or sas_env.lstrip('?')
+    if multi:
+        roots = [r.strip().strip("/") for r in multi.split(",") if r.strip()]
+    elif single:
+        roots = [single.strip().strip("/")]
+    else:
+        roots = ["firestarr", "firestarr/firestarr"]
 
-    discover = os.getenv('FIRESTARR_DISCOVER_LATEST', '0').strip() == '1'
-    if discover:
-        blob_names = discover_latest_tiles(run_date, horizon)
-        return [
-            _sas_join(f"{base}/{name}", sas_query, {})
-            for name in blob_names
-        ]
-
-    tmpl = os.getenv('TILE_TEMPLATE', '{prefix}/{ymd}/D{horizon}/tile_{ix}_{iy}.tif')
-    urls: List[str] = []
-    for ix, iy in grid:
-        path = tmpl.format(prefix=prefix, ymd=_ymd(run_date), horizon=horizon, ix=ix, iy=iy)
-        urls.append(_sas_join(f"{base}/{path}", sas_query, {}))
-    return urls
+    return [r + "/" for r in roots]
 
 
-def _safe_name(url: str) -> str:
-    p = urlparse(url)
-    return Path(p.path).name
+def _discover_m3_blobs(run_date: date, horizon: int) -> Optional[List[str]]:
+    """
+    m3 layout:
+      <root>/m3_YYYYMMDDHHMM/YYYYMMDD/YYN_XXXXX.tif
+
+    We:
+      - choose latest m3 run folder for run_date (YYYYMMDD)
+      - forecast_ymd = run_date + (horizon-1)
+      - list all .tif under .../<forecast_ymd>/
+    """
+    cc = _container_client()
+    run_ymd = _ymd(run_date)
+
+    log.debug(
+        "Discover m3: run_date=%s horizon=%s run_ymd=%s root_candidates=%s",
+        run_date.isoformat(),
+        horizon,
+        run_ymd,
+        _m3_root_candidates(),
+    )
+
+    chosen_run_prefix: Optional[str] = None
+
+    # Find the run prefix for this date by looking at immediate children under each root.
+    for root in _m3_root_candidates():
+        # root itself contains m3_* directories
+        prefixes = _list_child_prefixes(cc, root)
+        m3_prefixes = [p for p in prefixes if "m3_" in p]
+        run_prefix = _pick_latest_run_prefix_for_date(m3_prefixes, run_ymd)
+
+        log.debug("M3: root=%s prefixes=%d m3_prefixes=%d picked=%s", root, len(prefixes), len(m3_prefixes), run_prefix)
+
+        if run_prefix:
+            chosen_run_prefix = run_prefix
+            break
+
+    if not chosen_run_prefix:
+        log.debug("M3: no run prefix matched run_ymd=%s in any root", run_ymd)
+        return None
+
+    forecast_ymd = _ymd(run_date + timedelta(days=int(horizon) - 1))
+    forecast_prefix = f"{chosen_run_prefix}{forecast_ymd}/"
+
+    log.debug("M3: chosen_run_prefix=%s forecast_prefix=%s", chosen_run_prefix, forecast_prefix)
+
+    blobs = _list_blobs_flat(cc, forecast_prefix)
+    tifs = [b for b in blobs if b.lower().endswith(".tif")]
+
+    log.debug("M3: found %d tif(s) under %s", len(tifs), forecast_prefix)
+    return tifs or None
 
 
-def download_tiles(urls: List[str]) -> List[Path]:
-    tmpdir = Path(tempfile.mkdtemp(prefix='firestarr_'))
-    local_paths: List[Path] = []
-
-    for u in urls:
-        fn = tmpdir / _safe_name(u)
-        log.info(f'Downloading {u} -> {fn}')
-        with requests.get(u, stream=True, timeout=180) as r:
-            r.raise_for_status()
-            with open(fn, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=1 << 20):
-                    if chunk:
-                        f.write(chunk)
-        local_paths.append(fn)
-
-    return local_paths
+# -----------------------
+# Download
+# -----------------------
+def _safe_name(blob_name: str) -> str:
+    return Path(blob_name).name
 
 
-def _snap_bounds_to_res(bounds, res_m: float):
-    xmin, ymin, xmax, ymax = bounds
-    xmin_s = np.floor(xmin / res_m) * res_m
-    ymin_s = np.floor(ymin / res_m) * res_m
-    xmax_s = np.ceil(xmax / res_m) * res_m
-    ymax_s = np.ceil(ymax / res_m) * res_m
-    return float(xmin_s), float(ymin_s), float(xmax_s), float(ymax_s)
+def _download_one(cc: ContainerClient, blob_name: str, dest: Path) -> Path:
+    """
+    Download one blob to dest with simple retry.
+    """
+    tries, delay = 0, 1.0
+    while True:
+        tries += 1
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            bc = cc.get_blob_client(blob_name)
+            stream = bc.download_blob()
+            with open(dest, "wb") as f:
+                # Stream download. SDK handles chunking internally.
+                f.write(stream.readall())
+            return dest
+        except Exception as e:
+            if tries >= 5:
+                log.error("Download failed after %d tries: %s (%s)", tries, blob_name, e)
+                raise
+            log.warning("Download failed (try %d/5): %s (%s). Retrying in %.1fs", tries, blob_name, e, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 16.0)
 
 
-def mosaic_to_grid(tile_paths: List[Path], out_path: Path, dst_epsg: int = 3978, res_m: float = 100.0, mosaic_method: str = 'max') -> Path:
-    if not tile_paths:
-        raise ValueError('No tiles provided for mosaic')
+def download_blobs(blob_names: Sequence[str]) -> List[Path]:
+    """
+    Download blobs (names inside container) into FIRESTARR_TMP (or IVA_TMP) temp dir.
+    """
+    cc = _container_client()
+    tmp_root = Path(_env("FIRESTARR_TMP", _env("IVA_TMP", "/tmp")))
+    tmpdir = Path(tempfile.mkdtemp(prefix="firestarr_", dir=str(tmp_root)))
+    max_workers = int(_env("FIRESTARR_MAX_WORKERS", "10"))
 
-    src_files = [rasterio.open(str(p)) for p in tile_paths]
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("Downloading %d blobs to tmpdir=%s", len(blob_names), tmpdir)
+        log.debug("Blob sample=%s", _sample(list(blob_names), n=5))
 
-    mosaic, mosaic_transform = merge(src_files, method=mosaic_method)
-    src_meta = src_files[0].meta.copy()
-    src_crs = src_meta['crs']
+    # Threaded download (simple). If you prefer async later, azure.storage.blob.aio exists. 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for ds in src_files:
-        ds.close()
+    out: List[Path] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = []
+        for name in blob_names:
+            fn = tmpdir / _safe_name(name)
+            futs.append(ex.submit(_download_one, cc, name, fn))
+        for fut in as_completed(futs):
+            p = fut.result()
+            log.info("Downloaded: %s", p.name)
+            out.append(p)
 
-    dst_crs = f'EPSG:{dst_epsg}'
+    return out
 
-    h, w = mosaic.shape[1], mosaic.shape[2]
-    left, bottom, right, top = rasterio.transform.array_bounds(h, w, mosaic_transform)
-    dst_bounds = transform_bounds(src_crs, dst_crs, left, bottom, right, top, densify_pts=21)
-    xmin, ymin, xmax, ymax = _snap_bounds_to_res(dst_bounds, res_m)
+def _set_band_description_compat(dst, bidx: int, desc: str) -> None:
+    """
+    Rasterio compatibility:
+      - Prefer dst.set_band_description(bidx, desc) when available. [1](https://gis.stackexchange.com/questions/284179/add-bands-name-and-description-to-the-metadata-when-stacking-using-rasterio)[2](https://stackoverflow.com/questions/66589458/rasterio-set-a-unique-name-for-each-band)
+      - Otherwise try setting dst.descriptions tuple. [2](https://stackoverflow.com/questions/66589458/rasterio-set-a-unique-name-for-each-band)
+      - If neither is supported, silently skip (description is nice-to-have).
+    """
+    if hasattr(dst, "set_band_description"):
+        dst.set_band_description(bidx, desc)  # Rasterio >= 1.0 [1](https://gis.stackexchange.com/questions/284179/add-bands-name-and-description-to-the-metadata-when-stacking-using-rasterio)[2](https://stackoverflow.com/questions/66589458/rasterio-set-a-unique-name-for-each-band)
+        return
+    try:
+        # Some builds allow direct assignment
+        descs = list(getattr(dst, "descriptions", ()) or ())
+        while len(descs) < bidx:
+            descs.append(None)
+        descs[bidx - 1] = desc
+        dst.descriptions = tuple(descs)  # [2](https://stackoverflow.com/questions/66589458/rasterio-set-a-unique-name-for-each-band)
+    except Exception:
+        pass
 
-    dst_transform = from_origin(xmin, ymax, res_m, res_m)
-    dst_width = int(np.ceil((xmax - xmin) / res_m))
-    dst_height = int(np.ceil((ymax - ymin) / res_m))
-
-    dst_meta = src_meta.copy()
-    dst_meta.update({
-        'driver': 'GTiff',
-        'height': dst_height,
-        'width': dst_width,
-        'transform': dst_transform,
-        'crs': dst_crs,
-        'compress': 'deflate',
-        'tiled': True,
-        'blockxsize': 256,
-        'blockysize': 256,
-    })
-
-    log.info(f'Writing mosaic to {out_path} (CRS={dst_crs}, res={res_m}m, size={dst_width}x{dst_height}, method={mosaic_method}, resampling=nearest)')
-
+# -----------------------
+# Reproject + mosaic (unchanged behavior from your current approach)
+# -----------------------
+def _write_reproject_from_vrt(vrt: WarpedVRT, out_path: Path, *, nodata) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(out_path, 'w', **dst_meta) as dst:
-        for i in range(mosaic.shape[0]):
-            reproject(
-                source=mosaic[i],
-                destination=rasterio.band(dst, i + 1),
-                src_transform=mosaic_transform,
-                src_crs=src_crs,
-                dst_transform=dst_transform,
-                dst_crs=dst_crs,
-                resampling=Resampling.nearest,
-            )
-
+    data = vrt.read(1)
+    profile = vrt.profile.copy()
+    profile.update(
+        driver="GTiff",
+        compress="DEFLATE",
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+        count=1,
+        nodata=nodata,
+    )
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(data, 1)
+        _set_band_description_compat(dst, 1, "probability")
     return out_path
+
+
+def mosaic_tiles_reproject_first(
+    tile_paths: Sequence[Path],
+    out_path: Path,
+    *,
+    dst_epsg: int = 3978,
+    res_m: float = 100.0,
+    method: str = "max",
+) -> Path:
+    """
+    Reproject each tile via WarpedVRT (nearest, fixed resolution) and mosaic via rasterio.merge(method="max").
+    """
+    if not tile_paths:
+        raise ValueError("No tiles provided for mosaic")
+
+    dst_crs = f"EPSG:{dst_epsg}"
+    datasets = []
+    vrts = []
+    nodata = None
+
+    try:
+        for p in tile_paths:
+            ds = rasterio.open(p)
+            if ds.count != 1:
+                raise RuntimeError(f"Expected single-band tile; got {ds.count} bands: {p}")
+            if ds.nodata is None:
+                raise RuntimeError(f"Tile has no nodata set: {p}")
+
+            if nodata is None:
+                nodata = ds.nodata
+            elif ds.nodata != nodata:
+                raise RuntimeError(f"Tile nodata mismatch: {p} has {ds.nodata}, expected {nodata}")
+
+            vrt = WarpedVRT(
+                ds,
+                crs=dst_crs,
+                resampling=Resampling.nearest,
+                resolution=(res_m, res_m),
+                nodata=nodata,
+            )
+            datasets.append(ds)
+            vrts.append(vrt)
+
+        mosaic, transform = merge(
+            vrts,
+            method=method,
+            res=(res_m, res_m),
+            nodata=nodata,
+            target_aligned_pixels=True,
+        )
+        log.info("Reprojected tiles")
+        
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        log.info("Writing mosaic to %s", out_path.parent)
+        profile = vrts[0].profile.copy()
+        profile.update(
+            driver="GTiff",
+            height=mosaic.shape[1],
+            width=mosaic.shape[2],
+            transform=transform,
+            crs=dst_crs,
+            count=1,
+            nodata=nodata,
+            compress="DEFLATE",
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+        )
+        log.info("Profile: %s", profile)
+        with rasterio.open (out_path, "w", **profile) as dst:
+            dst.write(mosaic, 1)
+            _set_band_description_compat(dst, 1, "probability")
+
+        log.info("Wrote mosaic → %s (method=%s, CRS=%s, res=%.1fm)", out_path, method, dst_crs, res_m)
+        return out_path
+
+    finally:
+        for vrt in vrts:
+            try:
+                vrt.close()
+            except Exception:
+                pass
+        for ds in datasets:
+            try:
+                ds.close()
+            except Exception:
+                pass
+
+
+def reproject_single(src_path: Path, out_path: Path, *, dst_epsg: int = 3978, res_m: float = 100.0) -> Path:
+    """
+    Reproject a single already-mosaiced GeoTIFF to EPSG:dst_epsg at res_m using nearest.
+    """
+    dst_crs = f"EPSG:{dst_epsg}"
+    with rasterio.open(src_path) as src:
+        if src.count != 1:
+            raise RuntimeError(f"Expected single-band raster; got {src.count} bands: {src_path}")
+        if src.nodata is None:
+            raise RuntimeError(f"Source raster has no nodata set: {src_path}")
+
+        with WarpedVRT(
+            src,
+            crs=dst_crs,
+            resampling=Resampling.nearest,
+            resolution=(res_m, res_m),
+            nodata=src.nodata,
+        ) as vrt:
+            return _write_reproject_from_vrt(vrt, out_path, nodata=src.nodata)
+
+
+# -----------------------
+# Public API
+# -----------------------
+def get_firestarr_mosaic(run_date: date, day: int, out_dir: Path) -> Path:
+    """
+    End-to-end:
+      1) try archive exact file
+      2) else try m3 tiles
+      3) else raise
+    """
+    dst_epsg = int(_env("FIRESTARR_DST_EPSG", "3978"))
+    res_m = float(_env("FIRESTARR_RES_M", "100.0"))
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out_name = f"firestarr_{_ymd(run_date)}_day_{int(day):02d}_probability_epsg{dst_epsg}_{int(res_m)}m.tif"
+    out_path = out_dir / out_name
+
+    log.debug("get_firestarr_mosaic(run_date=%s day=%s) out=%s", run_date.isoformat(), day, out_path)
+
+    # 1) archive
+    archive_blob = _discover_archive_blob(run_date, int(day))
+    if archive_blob:
+        log.info("Using archive blob: %s", archive_blob)
+        local = download_blobs([archive_blob])[0]
+        return reproject_single(local, out_path, dst_epsg=dst_epsg, res_m=res_m)
+
+    # 2) m3
+    m3_blobs = _discover_m3_blobs(run_date, int(day))
+    if m3_blobs:
+        log.info("Using m3 blobs: %d tile(s)", len(m3_blobs))
+        tiles = download_blobs(m3_blobs)
+        return mosaic_tiles_reproject_first(tiles, out_path, dst_epsg=dst_epsg, res_m=res_m, method="max")
+
+    raise RuntimeError(f"No FireSTARR data found for run_date={run_date.isoformat()} day={day} in archive or m3")
+
+
+def get_firestarr_dayN_and_day7(run_date: date, forecast_day: int, out_dir: Path) -> Tuple[Path, Path]:
+    p = get_firestarr_mosaic(run_date, int(forecast_day), out_dir)
+    p7 = get_firestarr_mosaic(run_date, 7, out_dir)
+    return p, p7
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Fetch FireSTARR and produce EPSG:3978 100m mosaic(s).")
+    parser.add_argument("--run-date", type=str, default=date.today().isoformat(), help="Run date (YYYY-MM-DD).")
+    parser.add_argument("--day", type=int, default=3, help="Forecast day horizon (e.g., 3).")
+    parser.add_argument("--out-dir", type=str, default="./output", help="Output directory.")
+    parser.add_argument("--also-day7", action="store_true", help="Also fetch day 7.")
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default=os.getenv("FIRESTARR_LOG_LEVEL", "INFO"),
+        help="Logging level (DEBUG, INFO, WARNING...). Overrides FIRESTARR_LOG_LEVEL.",
+    )
+    args = parser.parse_args()
+
+    os.environ["FIRESTARR_LOG_LEVEL"] = (args.log_level or "INFO").upper().strip()
+    _setup_logging(force=True)
+
+    rd = date.fromisoformat(args.run_date)
+    out = Path(args.out_dir)
+
+    p = get_firestarr_mosaic(rd, args.day, out)
+    log.info("Output: %s", p)
+
+    if args.also_day7 and args.day != 7:
+        p7 = get_firestarr_mosaic(rd, 7, out)
+        log.info("Output day7: %s", p7)

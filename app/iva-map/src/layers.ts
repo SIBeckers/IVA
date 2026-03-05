@@ -4,8 +4,7 @@ import VectorTileSource from 'ol/source/VectorTile';
 import MVT from 'ol/format/MVT';
 import type BaseLayer from 'ol/layer/Base';
 import { Style, Stroke, Fill } from 'ol/style';
-
-import { proj3978, tileGrid3978 } from './projection';
+import { proj3857, proj3978, tileGrid3978 } from './projection';
 
 export type LayerKind = 'base' | 'overlay';
 
@@ -78,7 +77,7 @@ function mvt(id: string, url: string, style?: (f: any) => Style) {
   const source = new VectorTileSource({
     format: new MVT(),
     url,
-    // projection: proj3978,
+    projection: proj3857,
     // This is the critical piece: OL computes tile extents based on origin/resolutions/tileSize. [1](https://devopscycle.com/blog/the-ultimate-docker-compose-cheat-sheet)[2](https://www.compilenrun.com/docs/devops/docker/docker-compose/docker-compose-yaml/)
     // tileGrid: tileGrid3978,
   });
@@ -97,6 +96,9 @@ function mvt(id: string, url: string, style?: (f: any) => Style) {
     style: style ? (f) => style(f) : undefined,
     declutter: true,
     visible: true,
+    renderBuffer: 256,
+    renderMode: 'hybrid',
+    overlaps: false,
   });
 
   layer.set('id', id);
