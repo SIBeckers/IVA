@@ -54,6 +54,13 @@ INSERT INTO risk.feature_sets(code,name) VALUES
  ('buildings','Buildings')
 ON CONFLICT (code) DO NOTHING;
 
+-- Track idempotent ingestion of input datasets (per file)
+CREATE TABLE IF NOT EXISTS risk.ingest_state (
+  dataset_key  text PRIMARY KEY,
+  fingerprint  text NOT NULL,
+  loaded_at    timestamptz NOT NULL DEFAULT now()
+);
+
 -- ------------------------------------------------------------
 -- Features / Runs / Stats
 -- ------------------------------------------------------------
@@ -77,6 +84,7 @@ CREATE TABLE IF NOT EXISTS risk.runs (
   srs integer NOT NULL DEFAULT 3978,
   res_m integer NOT NULL DEFAULT 100,
   blob_uris text[] NOT NULL,
+  blob_names jsonb,
   created_at timestamptz DEFAULT now(),
   UNIQUE (run_date, forecast_day)
 );

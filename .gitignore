@@ -364,3 +364,4 @@ vite.config.ts.timestamp-*
 textfiles/*.txt
 README_files/*
 README.html
+*.tif

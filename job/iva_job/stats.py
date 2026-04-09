@@ -6,7 +6,9 @@ STAT_KEYS = ['n','v_min','p05','p25','p50','v_mean','p75','p95','v_max']
 def summarize(values: np.ndarray) -> Dict[str,float]:
     values = values[~np.isnan(values)]
     if values.size == 0:
-        return {k: None for k in STAT_KEYS}
+        out = {k: None for k in STAT_KEYS}
+        out["n"] = 0
+        return out
     q = np.quantile(values, [0.05,0.25,0.5,0.75,0.95])
     return {
         'n': int(values.size),

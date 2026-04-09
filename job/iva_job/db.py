@@ -49,21 +49,37 @@ def insert_run(
     run_id = cur.fetchone()[0]
 
     if blob_names:
-        # Try to store blob names in a dedicated column if present.
+        # Use a savepoint so a missing column does not abort the transaction
+        cur.execute("SAVEPOINT sp_blob_names")
+
         try:
             cur.execute(
-                """UPDATE risk.runs
-                   SET blob_names = %s
-                   WHERE id = %s""",
+                """
+                UPDATE risk.runs
+                SET blob_names = %s
+                WHERE id = %s
+                """,
                 (Json(blob_names), run_id),
             )
+            # Success → release savepoint
+            cur.execute("RELEASE SAVEPOINT sp_blob_names")
+
         except psycopg.Error:
-            # Column likely doesn't exist. Fall back: store both lists together in blob_uris.
-            payload = {"unsigned_urls": unsigned_urls, "blob_names": blob_names}
+            # Roll back only the failed UPDATE
+            cur.execute("ROLLBACK TO SAVEPOINT sp_blob_names")
+            cur.execute("RELEASE SAVEPOINT sp_blob_names")
+
+            # Fallback: store both in blob_uris
+            payload = {
+                "unsigned_urls": unsigned_urls,
+                "blob_names": blob_names,
+            }
             cur.execute(
-                """UPDATE risk.runs
-                   SET blob_uris = %s
-                   WHERE id = %s""",
+                """
+                UPDATE risk.runs
+                SET blob_uris = %s
+                WHERE id = %s
+                """,
                 (Json(payload), run_id),
             )
 
