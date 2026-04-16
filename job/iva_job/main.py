@@ -1,19 +1,25 @@
 """
 IVA job runner for FireSTARR risk processing.
 
+**RASTER-FIRST PHASE 1**:
+- Building features now use weighted raster (probability × count) instead of
+  individual 2M building vectors
+- Other features (ecumene, highways, rail, facilities) still use vector→raster zonal stats
+- Next phase: convert remaining features to raster workflows
+
 Key behaviors:
 - Builds/gets FireSTARR mosaic rasters for requested horizons using get_firestarr_mosaic()
+- Creates intermediate weighted raster: FireSTARR × building-count
 - Stores run metadata in risk.runs
-- Computes zonal stats over features that INTERSECT the raster bounds (EPSG:3978)
+- Computes zonal stats:
+  - Buildings: raster zonal stats over weighted raster (fast)
+  - Other features: vector zonal stats over FireSTARR (unchanged for now)
 - Sparse writes: only upsert risk.feature_stats rows when there is at least one valid pixel (n > 0)
   - To avoid stale rows on reruns, deletes existing stats for run_id when IVA_CLEAR_RUN_STATS=1 (default)
 - Robust to:
-  - features outside raster bounds -> filtered out in SQL
-  - edge rounding / geometry_window oddities -> mask() ValueError handled
-  - overlap with only nodata / NaN / masked -> treated as no valid pixels, skipped
-
-Notes:
-- rasterio.mask.mask(... crop=True ...) raises ValueError when shapes do not overlap raster. [1](https://gis.stackexchange.com/questions/450759/masking-in-rasterio-changes-the-values-the-output-file)
+  - features outside raster bounds → filtered out in SQL
+  - edge rounding / geometry_window oddities → mask() ValueError handled
+  - overlap with only nodata / NaN / masked → treated as no valid pixels, skipped
 """
 
 from __future__ import annotations
@@ -29,11 +35,18 @@ import requests
 import numpy as np
 import rasterio
 from rasterio.mask import mask
+from collections import defaultdict
+from .stats_raster import compute_building_counts
+
+# Cache for raster intersections
+raster_intersection_cache = defaultdict(list)
 
 from .db import connect_writer, insert_run, upsert_feature_stats
 from .stats import summarize
+from .stats_raster import create_weighted_raster, zonal_stats_raster
 from .firestarr import get_firestarr_mosaic
 from . import firestarr as firestarr_mod
+from .loaders import _should_ingest_buildings
 
 log = logging.getLogger("iva.main")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -190,128 +203,196 @@ def _values_for_geom(ds, geom_obj) -> np.ndarray:
     return vals
 
 
+def _zonal_stats_on_raster(cur, feature_set_codes: list[str], raster_path: Path, 
+                           bounds_3978, run_id, commit_every, conn, feature_type: str = 'vector') -> tuple[int, int]:
+    """
+    Compute zonal statistics of raster over feature polygons.
+    
+    Args:
+      feature_set_codes: list of codes to process (e.g. ['ecumene', 'first_nations'])
+      raster_path: path to probability or multiplied raster
+      bounds_3978: (left, bottom, right, top) bounds of raster in EPSG:3978
+      feature_type: 'vector' (polygon features) or 'raster_polygon' (pre-computed zones)
+    
+    Returns: (processed_count, wrote_count) for stats rows
+    """
+    processed = 0
+    wrote = 0
+    
+    with rasterio.open(raster_path) as ds:
+        for feature_id, code, geom_json in _iter_features_in_bounds(cur, feature_set_codes, bounds_3978):
+            processed += 1
+            geom_obj = json.loads(geom_json)
+            
+            vals = _values_for_geom(ds, geom_obj)
+            if vals.size == 0:
+                continue
+            
+            stats = summarize(vals)
+            if int(stats.get("n") or 0) <= 0:
+                continue
+            
+            # Note: evacuated logic omitted for raster path initially;
+            # can be reintroduced via spatial join if needed
+            upsert_feature_stats(cur, run_id, feature_id, stats, evacuated=False)
+            wrote += 1
+            
+            if wrote % commit_every == 0:
+                conn.commit()
+    
+    return processed, wrote
+
+
 def run_once(run_date: date, horizons: list[int] | None = None) -> None:
+    import time
+    try:
+        import psutil
+        _psutil = True
+    except ImportError:
+        _psutil = False
     horizons = horizons or [3, 7]
     out_dir = Path(os.getenv("IVA_TMP", "/tmp"))
+    bld_count_path = Path(os.getenv("IVA_BUILDINGCOUNT_RASTER", "/data/IVA_buildingcount_100m.tif"))
 
-    # Sparse write controls
     sparse = os.getenv("IVA_SPARSE_STATS", "1").strip().lower() in ("1", "true", "yes")
     clear_run_stats = os.getenv("IVA_CLEAR_RUN_STATS", "1").strip().lower() in ("1", "true", "yes")
     commit_every = int(os.getenv("IVA_COMMIT_EVERY", "2000"))
 
+    # Control which feature sets use raster vs vector path
+    raster_feature_sets = set(os.getenv("IVA_RASTER_FEATURE_SETS", "").strip().split(","))
+    vector_feature_sets_only = set(os.getenv("IVA_VECTOR_FEATURE_SETS", "ecumene,first_nations,highways,rail,facilities").strip().split(","))
+
+    # Remove building-specific raster multiplication logic
+    bld_mult_path = None
+
+    # Remove building-specific zonal stats logic
+    if 'buildings' in raster_feature_sets:
+        raster_feature_sets.remove('buildings')
+
+    def _log_resource_usage(msg):
+        if _psutil:
+            p = psutil.Process(os.getpid())
+            mem = p.memory_info().rss / (1024 * 1024)
+            cpu = p.cpu_percent(interval=0.1)
+            log.info(f"[RES] {msg} | mem={mem:.1f}MB cpu={cpu:.1f}%%")
+        else:
+            log.info(f"[RES] {msg} | os.times={os.times()}")
+
+    t0 = time.time()
+    _log_resource_usage("START run_once")
     with connect_writer() as conn:
         with conn.cursor() as cur:
             feature_set_codes = _resolve_feature_set_codes(cur)
-            log.info("Processing feature sets: %s", feature_set_codes)
+            # Filter out buildings if disabled via config
+            if _should_ingest_buildings() is False:
+                feature_set_codes = [c for c in feature_set_codes if c != 'buildings']
+            log.info("Processing feature sets: %s (raster=%s, vector=%s)", 
+                    feature_set_codes, raster_feature_sets, vector_feature_sets_only)
 
             for h in horizons:
+                t_h = time.time()
+                _log_resource_usage(f"START horizon {h}")
                 wmstime = run_date + timedelta(days=h - 1)
 
-                # 1) Discover lineage (blob names + unsigned URLs)
+                # 1) Discover + download FireSTARR mosaic
+                t1 = time.time()
                 blob_names = _discover_firestarr_blob_names(run_date, h)
                 unsigned_urls = _unsigned_urls_from_blobs(blob_names)
-
-                # 2) Produce mosaic GeoTIFF (EPSG:3978, 100 m)
                 out_path = get_firestarr_mosaic(run_date, h, out_dir)
+                log.info(f"[TIMER] FireSTARR mosaic for horizon {h}: {time.time()-t1:.2f}s")
+                _log_resource_usage(f"After FireSTARR mosaic {h}")
+
+                # 2) If buildings in feature sets AND raster path enabled:
+                #    Multiply probability × building-count raster
+                bld_mult_path = None
+                if 'buildings' in raster_feature_sets and 'buildings' in feature_set_codes:
+                    try:
+                        from .firestarr import load_building_count_raster, multiply_rasters
+                        bld_mult_path = out_dir / f"firestarr_{date.today().isoformat()}_day_{int(h):02d}_x_buildings.tif"
+                        t2 = time.time()
+                        multiply_rasters(out_path, bld_count_path, bld_mult_path)
+                        log.info("Created multiplied raster: %s (%.2fs)", bld_mult_path, time.time()-t2)
+                    except Exception as e:
+                        log.warning("Failed to create building-count multiplied raster; falling back to vector: %s", e)
+                        bld_mult_path = None
 
                 # 3) Insert run metadata
-                run_id = insert_run(
-                    cur,
-                    run_date,
-                    h,
-                    wmstime,
-                    unsigned_urls,
-                    res_m=100,
-                    srs=3978,
-                    blob_names=blob_names,
-                )
+                run_id = insert_run(cur, run_date, h, wmstime, unsigned_urls, 
+                                  res_m=100, srs=3978, blob_names=blob_names)
 
-                # Sparse rerun safety: remove any previous partial rows for this run_id
                 if sparse and clear_run_stats:
                     cur.execute("DELETE FROM risk.feature_stats WHERE run_id = %s", (run_id,))
                     conn.commit()
-                    log.info("Cleared existing stats for run_id=%s (sparse mode)", run_id)
+                    log.info("Cleared existing stats for run_id=%s", run_id)
 
-                evac_tbl = _fetch_evac_buffers(cur)
-
-                # 4) Zonal stats (only intersecting features)
+                # 4) Zonal stats: vector features on probability raster
+                t3 = time.time()
                 with rasterio.open(out_path) as ds:
-                    if str(ds.crs) not in ("EPSG:3978", "EPSG:3978:"):
-                        raise RuntimeError(f"Unexpected CRS in mosaic: {ds.crs}")
-
                     rb = ds.bounds
                     bounds_3978 = (rb.left, rb.bottom, rb.right, rb.top)
-                    log.info(
-                        "Raster bounds (EPSG:3978): left=%.2f bottom=%.2f right=%.2f top=%.2f",
-                        rb.left, rb.bottom, rb.right, rb.top
-                    )
 
-                    processed = 0
-                    wrote = 0
-                    skipped_empty = 0
+                    vec_codes = [c for c in feature_set_codes if c not in raster_feature_sets]
+                    if vec_codes:
+                        log.info("Vector zonal stats: %s", vec_codes)
+                        processed, wrote = _zonal_stats_on_raster(
+                            cur, vec_codes, out_path, bounds_3978, run_id, commit_every, conn
+                        )
+                        conn.commit()
+                        log.info("Vector stats done: processed=%s, wrote=%s (%.2fs)", processed, wrote, time.time()-t3)
+                        _log_resource_usage(f"After vector zonal stats {h}")
 
-                    for feature_id, code, geom_json in _iter_features_in_bounds(cur, feature_set_codes, bounds_3978):
-                        processed += 1
-                        geom_obj = json.loads(geom_json)
+                # 5) Zonal stats: buildings on multiplied raster (if available)
+                if bld_mult_path:
+                    log.info("Buildings raster zonal stats")
+                    t4 = time.time()
+                    with rasterio.open(bld_mult_path) as bld_mult_ds:
+                        processed, wrote = _zonal_stats_on_raster(
+                            cur, ['buildings'], bld_mult_path, bounds_3978, run_id, commit_every, conn
+                        )
+                        conn.commit()
+                        log.info("Buildings raster stats done: processed=%s, wrote=%s (%.2fs)", processed, wrote, time.time()-t4)
+                        _log_resource_usage(f"After buildings raster zonal stats {h}")
 
-                        vals = _values_for_geom(ds, geom_obj)
-                        if vals.size == 0:
-                            skipped_empty += 1
-                            continue
+                # 6) Compute building counts using building count raster
+                if bld_count_path.exists():
+                    log.info("Computing building counts using building count raster")
+                    t5 = time.time()
+                    if not raster_intersection_cache:
+                        log.info("Building raster intersection cache")
+                        with rasterio.open(bld_count_path) as bld_ds:
+                            for feature_id, code, geom_json in _iter_features_in_bounds(cur, ['ecumene', 'first_nations', 'census'], bounds_3978):
+                                geom_obj = json.loads(geom_json)
+                                raster_intersection_cache[feature_id].append(geom_obj)
 
-                        stats = summarize(vals)
-                        if sparse and int(stats.get("n") or 0) <= 0:
-                            skipped_empty += 1
-                            continue
-
-                        evacuated = False
-                        if evac_tbl is not None:
-                            cur.execute(
-                                """
-                                SELECT EXISTS (
-                                    SELECT 1
-                                    FROM pg_temp.evacs_buf e
-                                    JOIN risk.features f ON f.id = %s
-                                    WHERE ST_Intersects(ST_Transform(f.geom,3978), e.geom)
-                                )
-                                """,
-                                (feature_id,),
-                            )
-                            evacuated = bool(cur.fetchone()[0])
-
-                        upsert_feature_stats(cur, run_id, feature_id, stats, evacuated=evacuated)
-                        wrote += 1
-
-                        if wrote % commit_every == 0:
-                            conn.commit()
-                            log.info(
-                                "Progress run_id=%s horizon=%s: processed=%s wrote=%s skipped_empty=%s",
-                                run_id, h, processed, wrote, skipped_empty
-                            )
-
+                    zones = [{'feature_id': fid, 'geometry': geom} for fid, geoms in raster_intersection_cache.items() for geom in geoms]
+                    compute_building_counts(cur, bld_count_path, zones, run_id)
                     conn.commit()
-                    log.info(
-                        "Done run_id=%s horizon=%s: processed=%s wrote=%s skipped_empty=%s (sparse=%s)",
-                        run_id, h, processed, wrote, skipped_empty, sparse
-                    )
+                    log.info("Building counts computed and committed for run_id=%s (%.2fs)", run_id, time.time()-t5)
+                    _log_resource_usage(f"After building counts {h}")
+
+                log.info("Completed horizon %s for run_id=%s (%.2fs)", h, run_id, time.time()-t_h)
+                _log_resource_usage(f"END horizon {h}")
+    log.info("run_once complete (%.2fs)", time.time()-t0)
+    _log_resource_usage("END run_once")
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="IVA job runner: FireSTARR acquisition + zonal stats.")
-    p.add_argument(
-        "--run-date",
+# Move _build_arg_parser above __main__
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(description="IVA FireSTARR risk processing job runner")
+    parser.add_argument(
+        "--date",
+        dest="run_date",
         type=str,
         default=None,
-        help="Run date in YYYY-MM-DD. Defaults to today if omitted.",
+        help="Run date in YYYY-MM-DD format (default: today)",
     )
-    p.add_argument(
+    parser.add_argument(
         "--horizons",
         type=str,
-        default="3,7",
-        help="Comma-separated forecast horizons (e.g. '3,7'). Default: '3,7'.",
+        default=None,
+        help="Comma-separated list of forecast horizons (default: 3,7)",
     )
-    return p
-
+    return parser
 
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()

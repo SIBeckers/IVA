@@ -1,0 +1,3 @@
+# IVA job configuration
+# Set to true to enable building polygon ingestion, false to skip
+buildings_ingest: false

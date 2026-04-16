@@ -1,4 +1,3 @@
-
 -- db/ddl_patch_views.sql
 -- Latest-per-horizon-per-theme views + is_new flag.
 
@@ -103,27 +102,11 @@ SELECT run_date, forecast_day, feature_id, n, v_min, p05, p25, p50, v_mean, p75,
 FROM risk.v_latest_feature_stats_with_prev
 WHERE forecast_day=7 AND feature_set_id=(SELECT id FROM risk.feature_sets WHERE code='rail');
 
--- Buildings (raw layer available separately; d3/d7 provide identical structure)
-CREATE OR REPLACE VIEW risk.v_latest_buildings_d3 AS
-SELECT run_date, forecast_day, feature_id, n, v_min, p05, p25, p50, v_mean, p75, p95, v_max,
-       evacuated, is_new, feature_set_id, name, attrs,
-       ST_Multi(ST_Transform(geom,3978))::geometry(MultiPolygon,3978) AS geom
-FROM risk.v_latest_feature_stats_with_prev
-WHERE forecast_day=3 AND feature_set_id=(SELECT id FROM risk.feature_sets WHERE code='buildings');
-
-CREATE OR REPLACE VIEW risk.v_latest_buildings_d7 AS
-SELECT run_date, forecast_day, feature_id, n, v_min, p05, p25, p50, v_mean, p75, p95, v_max,
-       evacuated, is_new, feature_set_id, name, attrs,
-       ST_Multi(ST_Transform(geom,3978))::geometry(MultiPolygon,3978) AS geom
-FROM risk.v_latest_feature_stats_with_prev
-WHERE forecast_day=7 AND feature_set_id=(SELECT id FROM risk.feature_sets WHERE code='buildings');
-
 GRANT SELECT ON risk.v_prev_runs,
   risk.v_latest_feature_stats_with_prev,
   risk.v_latest_ecumene_d3, risk.v_latest_ecumene_d7,
   risk.v_latest_first_nations_d3, risk.v_latest_first_nations_d7,
   risk.v_latest_facilities_d3, risk.v_latest_facilities_d7,
   risk.v_latest_highways_d3, risk.v_latest_highways_d7,
-  risk.v_latest_rail_d3, risk.v_latest_rail_d7,
-  risk.v_latest_buildings_d3, risk.v_latest_buildings_d7
+  risk.v_latest_rail_d3, risk.v_latest_rail_d7
 TO iva_app;

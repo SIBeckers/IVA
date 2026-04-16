@@ -262,6 +262,21 @@ def _download_one(cc: ContainerClient, blob_name: str, dest: Path) -> Path:
 
 
 def download_blobs(blob_names: Sequence[str]) -> List[Path]:
+    import time
+    try:
+        import psutil
+        _psutil = True
+    except ImportError:
+        _psutil = False
+    def _log_resource_usage(msg):
+        if _psutil:
+            p = psutil.Process(os.getpid())
+            mem = p.memory_info().rss / (1024 * 1024)
+            cpu = p.cpu_percent(interval=0.1)
+            log.info(f"[RES] {msg} | mem={mem:.1f}MB cpu={cpu:.1f}%%")
+        else:
+            log.info(f"[RES] {msg} | os.times={os.times()}")
+
     cc = _container_client()
     tmp_root = Path(_env("FIRESTARR_TMP", _env("IVA_TMP", "/tmp")))
     tmpdir = Path(tempfile.mkdtemp(prefix="firestarr_", dir=str(tmp_root)))
@@ -271,6 +286,8 @@ def download_blobs(blob_names: Sequence[str]) -> List[Path]:
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    t0 = time.time()
+    _log_resource_usage(f"START download_blobs ({len(blob_names)} blobs, max_workers={max_workers})")
     out: List[Path] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = []
@@ -281,6 +298,8 @@ def download_blobs(blob_names: Sequence[str]) -> List[Path]:
             p = fut.result()
             log.info("Downloaded: %s", p.name)
             out.append(p)
+    log.info("[TIMER] download_blobs: %.2fs", time.time()-t0)
+    _log_resource_usage("END download_blobs")
     return out
 
 

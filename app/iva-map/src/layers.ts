@@ -31,7 +31,6 @@ const csdStyle = stylePoly('rgba(34,139,34,0.22)', '#2e8b57', 2.0); // slightly 
 const ecumeneBase = stylePoly('rgba(50,205,50,0.15)', '#2e8b57', 0.8);
 const fnBase = stylePoly('rgba(148,0,211,0.15)', '#6a0dad', 0.8);
 const facilitiesBase = stylePoly('rgba(31,120,180,0.12)', '#0c3a66', 1.0);
-const buildingsBase = stylePoly('rgba(52,52,255,0.92)', '#c3c9f', 0.8);
 
 const highwaysBase = styleLine('#f1b814', 2.2);
 const railBase = styleLine('#666', 2.2);
@@ -173,34 +172,10 @@ export function buildLayerEntries(): LayerEntry[] {
     lineRiskStyle
   );
 
-  const bldCsd = mvt(
-    'bld_csd',
-    `${TILESERV}/risk.v_buildings_csd_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`,
-    polygonChoroplethStyle
-  );
-
-  const bldEcu = mvt(
-    'bld_ecu',
-    `${TILESERV}/risk.v_buildings_ecumene_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`,
-    polygonChoroplethStyle
-  );
-
-  const bldFn = mvt(
-    'bld_fn',
-    `${TILESERV}/risk.v_buildings_fn_agg_latest/{z}/{x}/{y}.pbf?properties=forecast_day,bld_count,v_mean_p50,max_prob`,
-    polygonChoroplethStyle
-  );
-
   const ecumeneRaw = mvt(
     'ecumene_raw',
     `${TILESERV}/risk.v_features_ecumene_raw/{z}/{x}/{y}.pbf?properties=name`,
     () => ecumeneBase
-  );
-
-  const buildingsRaw = mvt(
-    'buildings_raw',
-    `${TILESERV}/risk.v_features_buildings_raw/{z}/{x}/{y}.pbf?properties=name`,
-    () => buildingsBase
   );
 
   const fnRaw = mvt(
@@ -245,15 +220,10 @@ export function buildLayerEntries(): LayerEntry[] {
     { id: 'hw_d7', layer: highwaysD7, visible: false, label: 'Highways (D7)', group: 'D7 Risk', kind: 'overlay' },
     { id: 'rail_d7', layer: railD7, visible: false, label: 'Rail (D7)', group: 'D7 Risk', kind: 'overlay' },
 
-    { id: 'bld_csd', layer: bldCsd, visible: false, label: 'Buildings → CSD (latest)', group: 'Buildings Aggregates', kind: 'overlay' },
-    { id: 'bld_ecu', layer: bldEcu, visible: false, label: 'Buildings → Ecumene (latest)', group: 'Buildings Aggregates', kind: 'overlay' },
-    { id: 'bld_fn', layer: bldFn, visible: false, label: 'Buildings → First Nations (latest)', group: 'Buildings Aggregates', kind: 'overlay' },
-
     { id: 'ecumene_raw', layer: ecumeneRaw, visible: false, label: 'Ecumene (raw)', group: 'Raw Reference', kind: 'overlay' },
     { id: 'first_nations_raw', layer: fnRaw, visible: false, label: 'First Nations (raw)', group: 'Raw Reference', kind: 'overlay' },
     { id: 'highways_raw', layer: highwaysRaw, visible: false, label: 'Highways (raw)', group: 'Raw Reference', kind: 'overlay' },
     { id: 'rail_raw', layer: railRaw, visible: false, label: 'Rail (raw)', group: 'Raw Reference', kind: 'overlay' },
     { id: 'facilities_raw', layer: facilitiesRaw, visible: false, label: 'Facilities (raw)', group: 'Raw Reference', kind: 'overlay' },
-    { id: 'buildings_raw', layer: buildingsRaw, visible: false, label: 'Buildings (raw)', group: 'Raw Reference', kind: 'overlay' },
   ];
 }

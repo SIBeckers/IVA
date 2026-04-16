@@ -7,6 +7,7 @@ import logging
 import shutil
 import tempfile
 import json
+import yaml
 from pathlib import Path
 from datetime import date, datetime
 from typing import Optional, Dict, Any, Tuple, List
@@ -58,6 +59,15 @@ def _jsonable(v: Any) -> Any:
             pass
     if isinstance(v, (datetime, date)):
         return v.isoformat()
+
+
+def _should_ingest_buildings(config_path="config.yaml"):
+    try:
+        with open(os.path.join(os.path.dirname(__file__), config_path), "r") as f:
+            config = yaml.safe_load(f)
+        return config.get("buildings_ingest", False)
+    except Exception:
+        return False
     return v
 
 
@@ -539,60 +549,84 @@ if __name__ == "__main__":
         copy_to_tmp=True,
     )
 
-    # Buildings files (idempotent per file)
-    blds = sorted(glob.glob(os.path.join(data_dir, "*_structures_en.gpkg")))
-    if not blds:
-        log.warning("no building files found matching *_structures_en.gpkg in %s", data_dir)
-        conn.close()
-        sys.exit(0)
+    # Buildings files (idempotent per file) - now optional
+    if _should_ingest_buildings():
+        log.info("Building polygon ingestion enabled via config.yaml")
+        blds = sorted(glob.glob(os.path.join(data_dir, "*_structures_en.gpkg")))
+        if not blds:
+            log.warning("no building files found matching *_structures_en.gpkg in %s", data_dir)
+            conn.close()
+            sys.exit(0)
 
-    workers = int(os.getenv("BUILDING_WORKERS", "0"))
-    enable_ecumene_filter = os.getenv("BUILDING_FILTER_ECUMENE", "0").strip().lower() in ("1", "true", "yes")
-
-    # Prepare ecumene union if filter enabled
-    ecumene_union_wkb = None
-    if enable_ecumene_filter:
-        log.info("preparing ECUMENE union for buildings filter")
+        import time
         try:
-            if ec is None:
-                ec_path = os.path.join(data_dir, "ECUMENE_V3.gpkg")
-                ec_safe = _copy_to_writable_tmp(ec_path)
-                ec = _read_gpkg_fast(ec_safe)
+            import psutil
+            _psutil = True
+        except ImportError:
+            _psutil = False
+        workers = int(os.getenv("BUILDING_WORKERS", "2"))
+
+        def _log_resource_usage(msg):
+            if _psutil:
+                p = psutil.Process(os.getpid())
+                mem = p.memory_info().rss / (1024 * 1024)
+                cpu = p.cpu_percent(interval=0.1)
+                log.info(f"[RES] {msg} | mem={mem:.1f}MB cpu={cpu:.1f}%%")
+            else:
+                log.info(f"[RES] {msg} | os.times={os.times()}")
+        enable_ecumene_filter = os.getenv("BUILDING_FILTER_ECUMENE", "0").strip().lower() in ("1", "true", "yes")
+
+        # Prepare ecumene union if filter enabled
+        ecumene_union_wkb = None
+        if enable_ecumene_filter:
+            log.info("preparing ECUMENE union for buildings filter")
+            try:
+                if ec is None:
+                    ec_path = os.path.join(data_dir, "ECUMENE_V3.gpkg")
+                    ec_safe = _copy_to_writable_tmp(ec_path)
+                    ec = _read_gpkg_fast(ec_safe)
                 if ec.crs is None or ec.crs.to_epsg() != EPSG:
                     ec = ec.to_crs(EPSG)
 
-            union_geom = ec.unary_union if hasattr(ec, "unary_union") else getattr(ec, "unary_all")
-            ecumene_union_wkb = union_geom.wkb
-            log.info("ECUMENE union prepared")
-        except Exception as e:
-            log.warning("failed to prepare ECUMENE union; disabling filter: %s", e)
-            enable_ecumene_filter = False
-            ecumene_union_wkb = None
+                union_geom = ec.unary_union if hasattr(ec, "unary_union") else getattr(ec, "unary_all")
+                ecumene_union_wkb = union_geom.wkb
+                log.info("ECUMENE union prepared")
+            except Exception as e:
+                log.warning("failed to prepare ECUMENE union; disabling filter: %s", e)
+                enable_ecumene_filter = False
+                ecumene_union_wkb = None
 
-    # Run building imports
-    if workers and workers > 1:
-        from multiprocessing import get_context
-
-        log.info("importing %d building files with %d workers", len(blds), workers)
-        ctx = get_context()
-        with ctx.Pool(
-            processes=workers,
-            initializer=_pool_init_ecumene,
-            initargs=(ecumene_union_wkb, enable_ecumene_filter),
-        ) as pool:
-            results = pool.map(_process_building, blds)
-            inserted = sum(r[2] for r in results)
-            skipped = sum(1 for r in results if r[1] == 0 and r[2] == 0)
-            log.info("completed buildings import: approx_inserted=%d files=%d skipped_files=%d", inserted, len(blds), skipped)
+        # Run building imports
+        if workers and workers > 1:
+            from multiprocessing import get_context
+            log.info("importing %d building files with %d workers", len(blds), workers)
+            t0 = time.time()
+            _log_resource_usage("START building import (parallel)")
+            ctx = get_context()
+            with ctx.Pool(
+                processes=workers,
+                initializer=_pool_init_ecumene,
+                initargs=(ecumene_union_wkb, enable_ecumene_filter),
+            ) as pool:
+                results = pool.map(_process_building, blds)
+                inserted = sum(r[2] for r in results)
+                skipped = sum(1 for r in results if r[1] == 0 and r[2] == 0)
+                log.info("completed buildings import: approx_inserted=%d files=%d skipped_files=%d (%.2fs)", inserted, len(blds), skipped, time.time()-t0)
+                _log_resource_usage("END building import (parallel)")
+        else:
+            t0 = time.time()
+            _log_resource_usage("START building import (serial)")
+            _pool_init_ecumene(ecumene_union_wkb, enable_ecumene_filter)
+            inserted = 0
+            skipped = 0
+            for b in blds:
+                _, init_n, ins = _process_building(b)
+                inserted += ins
+                if init_n == 0 and ins == 0:
+                    skipped += 1
+            log.info("completed buildings import: approx_inserted=%d files=%d skipped_files=%d (%.2fs)", inserted, len(blds), skipped, time.time()-t0)
+            _log_resource_usage("END building import (serial)")
     else:
-        _pool_init_ecumene(ecumene_union_wkb, enable_ecumene_filter)
-        inserted = 0
-        skipped = 0
-        for b in blds:
-            _, init_n, ins = _process_building(b)
-            inserted += ins
-            if init_n == 0 and ins == 0:
-                skipped += 1
-        log.info("completed buildings import: approx_inserted=%d files=%d skipped_files=%d", inserted, len(blds), skipped)
+        log.info("Building polygon ingestion disabled via config.yaml - skipping")
 
     conn.close()

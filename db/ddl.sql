@@ -1,4 +1,3 @@
-
 -- =====================================================================
 -- IVA Database DDL (Full Replacement)
 -- Adds: SQL-only ingestion of CSD 2025 & reference GeoPackages using ogr_fdw
@@ -266,77 +265,77 @@ END$$;
 -- ------------------------------------------------------------
 -- Aggregates: Buildings → CSD / Ecumene / First Nations (per run)
 -- ------------------------------------------------------------
-CREATE MATERIALIZED VIEW IF NOT EXISTS risk.mv_buildings_csd_agg AS
-SELECT s.run_id,
-       csd.csduid AS csd_id,
-       COUNT(*) AS bld_count,
-       percentile_disc(0.5) WITHIN GROUP (ORDER BY s.v_mean) AS v_mean_p50,
-       MAX(s.v_max) AS max_prob
-FROM risk.feature_stats s
-JOIN risk.features f ON f.id = s.feature_id
-JOIN public.census_subdivisions_2025 csd ON ST_Intersects(f.geom, csd.geom)
-WHERE f.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='buildings')
-GROUP BY s.run_id, csd.csduid;
-CREATE UNIQUE INDEX IF NOT EXISTS mv_buildings_csd_agg_idx ON risk.mv_buildings_csd_agg (run_id, csd_id);
+-- CREATE MATERIALIZED VIEW IF NOT EXISTS risk.mv_buildings_csd_agg AS
+-- SELECT s.run_id,
+--        csd.csduid AS csd_id,
+--        COUNT(*) AS bld_count,
+--        percentile_disc(0.5) WITHIN GROUP (ORDER BY s.v_mean) AS v_mean_p50,
+--        MAX(s.v_max) AS max_prob
+-- FROM risk.feature_stats s
+-- JOIN risk.features f ON f.id = s.feature_id
+-- JOIN public.census_subdivisions_2025 csd ON ST_Intersects(f.geom, csd.geom)
+-- WHERE f.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='buildings')
+-- GROUP BY s.run_id, csd.csduid;
+-- CREATE UNIQUE INDEX IF NOT EXISTS mv_buildings_csd_agg_idx ON risk.mv_buildings_csd_agg (run_id, csd_id);
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS risk.mv_buildings_ecumene_agg AS
-SELECT s.run_id,
-       fz.source_pk AS ecumene_pk,
-       COUNT(*) AS bld_count,
-       percentile_disc(0.5) WITHIN GROUP (ORDER BY s.v_mean) AS v_mean_p50,
-       MAX(s.v_max) AS max_prob
-FROM risk.feature_stats s
-JOIN risk.features f ON f.id = s.feature_id
-JOIN risk.features fz
-  ON fz.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='ecumene')
- AND ST_Intersects(f.geom, fz.geom)
-WHERE f.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='buildings')
-GROUP BY s.run_id, fz.source_pk;
-CREATE UNIQUE INDEX IF NOT EXISTS mv_buildings_ecumene_agg_idx ON risk.mv_buildings_ecumene_agg (run_id, ecumene_pk);
+-- CREATE MATERIALIZED VIEW IF NOT EXISTS risk.mv_buildings_ecumene_agg AS
+-- SELECT s.run_id,
+--        fz.source_pk AS ecumene_pk,
+--        COUNT(*) AS bld_count,
+--        percentile_disc(0.5) WITHIN GROUP (ORDER BY s.v_mean) AS v_mean_p50,
+--        MAX(s.v_max) AS max_prob
+-- FROM risk.feature_stats s
+-- JOIN risk.features f ON f.id = s.feature_id
+-- JOIN risk.features fz
+--   ON fz.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='ecumene')
+--  AND ST_Intersects(f.geom, fz.geom)
+-- WHERE f.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='buildings')
+-- GROUP BY s.run_id, fz.source_pk;
+-- CREATE UNIQUE INDEX IF NOT EXISTS mv_buildings_ecumene_agg_idx ON risk.mv_buildings_ecumene_agg (run_id, ecumene_pk);
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS risk.mv_buildings_fn_agg AS
-SELECT s.run_id,
-       fn.source_pk AS fn_pk,
-       COUNT(*) AS bld_count,
-       percentile_disc(0.5) WITHIN GROUP (ORDER BY s.v_mean) AS v_mean_p50,
-       MAX(s.v_max) AS max_prob
-FROM risk.feature_stats s
-JOIN risk.features f ON f.id = s.feature_id
-JOIN risk.features fn
-  ON fn.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='first_nations')
- AND ST_Intersects(f.geom, fn.geom)
-WHERE f.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='buildings')
-GROUP BY s.run_id, fn.source_pk;
-CREATE UNIQUE INDEX IF NOT EXISTS mv_buildings_fn_agg_idx ON risk.mv_buildings_fn_agg (run_id, fn_pk);
+-- CREATE MATERIALIZED VIEW IF NOT EXISTS risk.mv_buildings_fn_agg AS
+-- SELECT s.run_id,
+--        fn.source_pk AS fn_pk,
+--        COUNT(*) AS bld_count,
+--        percentile_disc(0.5) WITHIN GROUP (ORDER BY s.v_mean) AS v_mean_p50,
+--        MAX(s.v_max) AS max_prob
+-- FROM risk.feature_stats s
+-- JOIN risk.features f ON f.id = s.feature_id
+-- JOIN risk.features fn
+--   ON fn.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='first_nations')
+--  AND ST_Intersects(f.geom, fn.geom)
+-- WHERE f.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='buildings')
+-- GROUP BY s.run_id, fn.source_pk;
+-- CREATE UNIQUE INDEX IF NOT EXISTS mv_buildings_fn_agg_idx ON risk.mv_buildings_fn_agg (run_id, fn_pk);
 
 -- Latest (geom-included) intersection views for publishing
-CREATE OR REPLACE VIEW risk.v_buildings_csd_agg_latest AS
-SELECT r.run_date, r.forecast_day, a.csd_id, a.bld_count, a.v_mean_p50, a.max_prob, 
-  ST_Multi(ST_Transform(csd.geom, 3978))::geometry(MultiPolygon, 3978) AS geom
-FROM risk.mv_buildings_csd_agg a
-JOIN risk.runs r ON r.id = a.run_id
-JOIN risk.v_latest_runs lr ON lr.id = a.run_id
-JOIN public.census_subdivisions csd ON csd.csduid = a.csd_id;
+-- CREATE OR REPLACE VIEW risk.v_buildings_csd_agg_latest AS
+-- SELECT r.run_date, r.forecast_day, a.csd_id, a.bld_count, a.v_mean_p50, a.max_prob, 
+--   ST_Multi(ST_Transform(csd.geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+-- FROM risk.mv_buildings_csd_agg a
+-- JOIN risk.runs r ON r.id = a.run_id
+-- JOIN risk.v_latest_runs lr ON lr.id = a.run_id
+-- JOIN public.census_subdivisions csd ON csd.csduid = a.csd_id;
 
-CREATE OR REPLACE VIEW risk.v_buildings_ecumene_agg_latest AS
-SELECT r.run_date, r.forecast_day, a.ecumene_pk, a.bld_count, a.v_mean_p50, a.max_prob, 
-  ST_Multi(ST_Transform(fz.geom, 3978))::geometry(MultiPolygon, 3978) AS geom
-FROM risk.mv_buildings_ecumene_agg a
-JOIN risk.runs r ON r.id = a.run_id
-JOIN risk.v_latest_runs lr ON lr.id = a.run_id
-JOIN risk.features fz
-  ON fz.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='ecumene')
- AND fz.source_pk = a.ecumene_pk;
+-- CREATE OR REPLACE VIEW risk.v_buildings_ecumene_agg_latest AS
+-- SELECT r.run_date, r.forecast_day, a.ecumene_pk, a.bld_count, a.v_mean_p50, a.max_prob, 
+--   ST_Multi(ST_Transform(fz.geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+-- FROM risk.mv_buildings_ecumene_agg a
+-- JOIN risk.runs r ON r.id = a.run_id
+-- JOIN risk.v_latest_runs lr ON lr.id = a.run_id
+-- JOIN risk.features fz
+--   ON fz.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='ecumene')
+--  AND fz.source_pk = a.ecumene_pk;
 
-CREATE OR REPLACE VIEW risk.v_buildings_fn_agg_latest AS
-SELECT r.run_date, r.forecast_day, a.fn_pk, a.bld_count, a.v_mean_p50, a.max_prob, 
-  ST_Multi(ST_Transform(fn.geom, 3978))::geometry(MultiPolygon, 3978) AS geom
-FROM risk.mv_buildings_fn_agg a
-JOIN risk.runs r ON r.id = a.run_id
-JOIN risk.v_latest_runs lr ON lr.id = a.run_id
-JOIN risk.features fn
-  ON fn.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='first_nations')
- AND fn.source_pk = a.fn_pk;
+-- CREATE OR REPLACE VIEW risk.v_buildings_fn_agg_latest AS
+-- SELECT r.run_date, r.forecast_day, a.fn_pk, a.bld_count, a.v_mean_p50, a.max_prob, 
+--   ST_Multi(ST_Transform(fn.geom, 3978))::geometry(MultiPolygon, 3978) AS geom
+-- FROM risk.mv_buildings_fn_agg a
+-- JOIN risk.runs r ON r.id = a.run_id
+-- JOIN risk.v_latest_runs lr ON lr.id = a.run_id
+-- JOIN risk.features fn
+--   ON fn.feature_set_id = (SELECT id FROM risk.feature_sets WHERE code='first_nations')
+--  AND fn.source_pk = a.fn_pk;
 
 -- ------------------------------------------------------------
 -- ogr_fdw Servers for your GeoPackages (files are at /data)

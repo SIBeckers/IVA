@@ -116,6 +116,8 @@ services:
     env_file: [ .env ]
     environment:
       - FEATURE_SET_CODES=ecumene,first_nations,highways,rail,facilities,buildings
+      - IVA_RASTER_FEATURE_SETS=buildings
+      - IVA_BUILDINGCOUNT_RASTER=/data/IVA_buildingcount_100m.tif
       - PGPASSWORD=${PGPASSWORD}
       - PGHOST=postgis
       - PGPORT=5432
@@ -127,7 +129,13 @@ services:
       initdb:
         condition: service_completed_successfully
     restart: on-failure
-    command: ["bash","-c","sleep 10 && python -m iva_job.loaders /data && python -m iva_job.main"]
+    # Updated command: use CLI + explicit sequence
+    command: [
+      "bash", "-c",
+      "sleep 10 && \
+       python -m iva_job.loaders /data && \
+       python -m iva_job.cli --run-date 2026-04-09 --horizons 3,7"
+    ]
     volumes:
       - ./data:/data:ro
     networks:

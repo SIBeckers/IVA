@@ -16,5 +16,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY iva_job ./iva_job
+COPY iva_job/config.yaml ./iva_job/config.yaml
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 CMD ["python", "-m", "iva_job.main"]
