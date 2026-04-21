@@ -3,7 +3,7 @@ IVA job runner for FireSTARR risk processing.
 
 **RASTER-FIRST PHASE 1**:
 - Building features now use weighted raster (probability × count) instead of
-  individual 2M building vectors
+  individual 10M building vectors
 - Other features (ecumene, highways, rail, facilities) still use vector→raster zonal stats
 - Next phase: convert remaining features to raster workflows
 

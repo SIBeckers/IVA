@@ -438,7 +438,7 @@ def mosaic_tiles_reproject_first(
         # Estimate raw payload (not compressed) for intuition
         dtype = vrts[0].dtypes[0]
         bpp = rasterio.dtypes.get_minimum_dtype([dtype]).itemsize if hasattr(dtype, "itemsize") else 4
-        est_gb = (pixels * 4) / (1024**3)  # assume ~4 bytes per pixel typical float32
+        est_gb = (pixels * bpp) / (1024**3)  # assume ~4 bytes per pixel typical float32
         log.info("Mosaic bounds used: %s (user=%s)", ab, bool(user_bounds))
         log.info("Mosaic grid: %dx%d (~%.2f GB raw for float32-ish)", width, height, est_gb)
 
@@ -460,9 +460,9 @@ def mosaic_tiles_reproject_first(
             BIGTIFF="IF_SAFER",
         )
 
-        mem_limit_mb = int(_env("FIRESTARR_MERGE_MEM_LIMIT_MB", "128"))
-        gdal_cache_mb = int(_env("FIRESTARR_GDAL_CACHEMAX_MB", "256"))
-        gdal_threads = _env("FIRESTARR_GDAL_NUM_THREADS", "1")
+        mem_limit_mb = int(_env("FIRESTARR_MERGE_MEM_LIMIT_MB", "1024"))
+        gdal_cache_mb = int(_env("FIRESTARR_GDAL_CACHEMAX_MB", "512"))
+        gdal_threads = _env("FIRESTARR_GDAL_NUM_THREADS", "2")
 
         log.info("Writing mosaic to %s", out_path)
         log.info(

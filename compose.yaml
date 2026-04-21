@@ -132,9 +132,9 @@ services:
     # Updated command: use CLI + explicit sequence
     command: [
       "bash", "-c",
-      "sleep 10 && \
+      "sleep 5 && \
        python -m iva_job.loaders /data && \
-       python -m iva_job.cli --run-date 2026-04-09 --horizons 3,7"
+       python -m iva_job.cli --run-date 2026-04-21 --horizons 3,7 --skip-loader"
     ]
     volumes:
       - ./data:/data:ro
