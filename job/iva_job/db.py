@@ -1,8 +1,12 @@
-import os
-import psycopg
-from psycopg.types.json import Json
+from __future__ import annotations
 
-def connect_writer():
+import os
+from typing import Any
+
+import psycopg
+
+
+def connect_writer() -> psycopg.Connection:
     return psycopg.connect(
         host=os.getenv("PGHOST", "postgis"),
         port=os.getenv("PGPORT", "5432"),
@@ -11,95 +15,63 @@ def connect_writer():
         password=os.getenv("PGPASSWORD", "changeme-job"),
     )
 
+
 def insert_run(
     cur,
     run_date,
     forecast_day,
     wmstime,
     unsigned_urls,
-    res_m=100,
-    srs=3978,
-    blob_names=None,
-):
-    """
-    Insert/update a run row.
-
-    Backward compatible behavior:
-      - Always writes unsigned_urls into risk.runs.blob_uris (existing column). [1](https://041gc-my.sharepoint.com/personal/justin_beckers_nrcan-rncan_gc_ca/Documents/Microsoft%20Copilot%20Chat%20Files/db.py)
-
-    Extended behavior:
-      - If blob_names is provided, tries to store it in risk.runs.blob_names (json/jsonb).
-      - If that column doesn't exist, falls back to storing both arrays in blob_uris as JSON object:
-          {"unsigned_urls": [...], "blob_names": [...]}
-    """
-    blob_names = blob_names or []
-
-    # First: do the normal upsert using blob_uris as a list of strings (unsigned URLs)
+    res_m: int = 100,
+    srs: int = 3978,
+    blob_names: Any = None,
+) -> int:
     cur.execute(
-        """INSERT INTO risk.runs(run_date, forecast_day, wmstime, blob_uris, res_m, srs)
-           VALUES (%s,%s,%s,%s,%s,%s)
-           ON CONFLICT (run_date, forecast_day)
-           DO UPDATE SET wmstime=EXCLUDED.wmstime,
-                         blob_uris=EXCLUDED.blob_uris,
-                         res_m=EXCLUDED.res_m,
-                         srs=EXCLUDED.srs
-           RETURNING id""",
-        (run_date, forecast_day, wmstime, unsigned_urls, res_m, srs),
+        """
+        INSERT INTO risk.runs (
+            run_date, forecast_day, wmstime, srs, res_m, blob_uris, blob_names
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+        ON CONFLICT (run_date, forecast_day)
+        DO UPDATE SET
+            wmstime   = EXCLUDED.wmstime,
+            srs       = EXCLUDED.srs,
+            res_m     = EXCLUDED.res_m,
+            blob_uris = EXCLUDED.blob_uris,
+            blob_names = EXCLUDED.blob_names
+        RETURNING id
+        """,
+        (run_date, forecast_day, wmstime, srs, res_m, unsigned_urls or [], blob_names),
     )
-    run_id = cur.fetchone()[0]
+    return cur.fetchone()[0]
 
-    if blob_names:
-        # Use a savepoint so a missing column does not abort the transaction
-        cur.execute("SAVEPOINT sp_blob_names")
 
-        try:
-            cur.execute(
-                """
-                UPDATE risk.runs
-                SET blob_names = %s
-                WHERE id = %s
-                """,
-                (Json(blob_names), run_id),
-            )
-            # Success → release savepoint
-            cur.execute("RELEASE SAVEPOINT sp_blob_names")
+def clear_run_outputs(cur, run_id: int) -> None:
+    cur.execute("DELETE FROM risk.building_zone_exposure WHERE run_id = %s", (run_id,))
+    cur.execute("DELETE FROM risk.building_zone_stats WHERE run_id = %s", (run_id,))
+    cur.execute("DELETE FROM risk.feature_stats WHERE run_id = %s", (run_id,))
 
-        except psycopg.Error:
-            # Roll back only the failed UPDATE
-            cur.execute("ROLLBACK TO SAVEPOINT sp_blob_names")
-            cur.execute("RELEASE SAVEPOINT sp_blob_names")
 
-            # Fallback: store both in blob_uris
-            payload = {
-                "unsigned_urls": unsigned_urls,
-                "blob_names": blob_names,
-            }
-            cur.execute(
-                """
-                UPDATE risk.runs
-                SET blob_uris = %s
-                WHERE id = %s
-                """,
-                (Json(payload), run_id),
-            )
-
-    return run_id
-
-def upsert_feature_stats(cur, run_id, feature_id, stats, evacuated=False):
+def upsert_feature_stats(cur, run_id, feature_id, stats, evacuated: bool = False) -> None:
     cur.execute(
-        """INSERT INTO risk.feature_stats(run_id, feature_id, n, v_min, p05, p25, p50, v_mean, p75, p95, v_max, evacuated)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-           ON CONFLICT (run_id, feature_id)
-           DO UPDATE SET n=EXCLUDED.n,
-                         v_min=EXCLUDED.v_min,
-                         p05=EXCLUDED.p05,
-                         p25=EXCLUDED.p25,
-                         p50=EXCLUDED.p50,
-                         v_mean=EXCLUDED.v_mean,
-                         p75=EXCLUDED.p75,
-                         p95=EXCLUDED.p95,
-                         v_max=EXCLUDED.v_max,
-                         evacuated=EXCLUDED.evacuated""",
+        """
+        INSERT INTO risk.feature_stats (
+            run_id, feature_id, n, v_min, p05, p25, p50, v_mean, p75, p95, v_max, evacuated
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (run_id, feature_id)
+        DO UPDATE SET
+            n         = EXCLUDED.n,
+            v_min     = EXCLUDED.v_min,
+            p05       = EXCLUDED.p05,
+            p25       = EXCLUDED.p25,
+            p50       = EXCLUDED.p50,
+            v_mean    = EXCLUDED.v_mean,
+            p75       = EXCLUDED.p75,
+            p95       = EXCLUDED.p95,
+            v_max     = EXCLUDED.v_max,
+            evacuated = EXCLUDED.evacuated
+        """,
         (
             run_id,
             feature_id,
@@ -114,4 +86,42 @@ def upsert_feature_stats(cur, run_id, feature_id, stats, evacuated=False):
             stats.get("v_max"),
             evacuated,
         ),
+    )
+
+
+def upsert_building_zone_stats(
+    cur,
+    run_id: int,
+    feature_set_id: int,
+    feature_id: int,
+    building_count: int,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO risk.building_zone_stats
+            (run_id, feature_set_id, feature_id, building_count)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (run_id, feature_set_id, feature_id)
+        DO UPDATE SET building_count = EXCLUDED.building_count
+        """,
+        (run_id, feature_set_id, feature_id, building_count),
+    )
+
+
+def upsert_building_zone_exposure(
+    cur,
+    run_id: int,
+    feature_set_id: int,
+    feature_id: int,
+    expected_buildings: float,
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO risk.building_zone_exposure
+            (run_id, feature_set_id, feature_id, expected_buildings)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (run_id, feature_set_id, feature_id)
+        DO UPDATE SET expected_buildings = EXCLUDED.expected_buildings
+        """,
+        (run_id, feature_set_id, feature_id, expected_buildings),
     )

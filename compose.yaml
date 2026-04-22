@@ -2,24 +2,19 @@ services:
   postgis:
     build:
       context: ./db
-      dockerfile: Dockerfile.db       # extends postgis/postgis:18-3.6 and installs ogr_fdw
+      dockerfile: Dockerfile.db
     image: iva/postgis:18-3.6-ogrfdw
     container_name: postgis
     environment:
-      - POSTGRES_DB=impacted_values
-      - POSTGRES_USER=iva_job
-      - POSTGRES_PASSWORD=${PGPASSWORD}
-      # First-time cluster init: SCRAM
-      - POSTGRES_INITDB_ARGS=--auth=scram-sha-256
+      POSTGRES_DB: impacted_values
+      POSTGRES_USER: iva_job
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+      POSTGRES_INITDB_ARGS: --auth=scram-sha-256
     ports:
       - "5432:5432"
     volumes:
-      # PG 18 path (image creates /var/lib/postgresql/18/docker)
       - pgdata:/var/lib/postgresql
-      # Make ddl.sql visible; init service will run it via psql
       - ./db/ddl.sql:/ddl/ddl.sql:ro
-      - ./db/ddl_patch_views.sql:/ddl/ddl_patch_views.sql:ro
-      # Mount your data so ogr_fdw in ddl.sql can read gpkg files
       - ./data:/data:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "iva_job", "-d", "impacted_values"]
@@ -29,7 +24,6 @@ services:
     networks:
       - iva_net
 
-  # One-shot init that applies db/ddl.sql WITH password variables
   initdb:
     image: postgres:18
     container_name: iva-initdb
@@ -37,40 +31,45 @@ services:
       postgis:
         condition: service_healthy
     environment:
-      - PGPASSWORD=${PGPASSWORD}
-      - APP_PGPASSWORD=${APP_PGPASSWORD}
+      PGPASSWORD: ${PGPASSWORD}
+      APP_PGPASSWORD: ${APP_PGPASSWORD}
     volumes:
       - ./db/ddl.sql:/ddl/ddl.sql:ro
-      - ./db/ddl_patch_views.sql:/ddl/ddl_patch_views.sql:ro
     entrypoint:
       - bash
       - -c
-      - |
-        psql -h postgis -U iva_job -d impacted_values \
-          -v app_pass="${APP_PGPASSWORD}" -v job_pass="${PGPASSWORD}" \
-          -f /ddl/ddl.sql && \
-        psql -h postgis -U iva_job -d impacted_values \
-          -v app_pass="${APP_PGPASSWORD}" -v job_pass="${PGPASSWORD}" \
-          -f /ddl/ddl_patch_views.sql
+      - >
+        psql -h postgis -U iva_job -d impacted_values
+        -v app_pass="$APP_PGPASSWORD"
+        -v job_pass="$PGPASSWORD"
+        -f /ddl/ddl.sql
     restart: "no"
     networks:
       - iva_net
 
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
-    container_name: pgbouncer
-    restart: unless-stopped
+  load-zones:
+    build:
+      context: ./job
+    container_name: iva-load-zones
+    env_file: [.env]
     environment:
-      # Generates userlist & pgbouncer.ini (uses the secrets you provide)
-      - DATABASE_URLS=postgres://iva_app:${APP_PGPASSWORD}@postgis/impacted_values,postgres://iva_job:${PGPASSWORD}@postgis/impacted_values
-      - POOL_MODE=transaction
-      - MAX_CLIENT_CONN=5000
-      - AUTH_TYPE=scram-sha-256
-    ports:
-      - "6432:5432"   # host 6432 -> container 5432
+      PGPASSWORD: ${PGPASSWORD}
+      PGHOST: postgis
+      PGPORT: 5432
+      PGUSER: iva_job
+      PGDATABASE: impacted_values
     depends_on:
-      postgis:
-        condition: service_healthy
+      initdb:
+        condition: service_completed_successfully
+    restart: "no"
+    command:
+      [
+        "bash",
+        "-c",
+        "python -m iva_job.loaders /data"
+      ]
+    volumes:
+      - ./data:/data:ro
     networks:
       - iva_net
 
@@ -78,8 +77,8 @@ services:
     image: pramsey/pg_tileserv:latest
     container_name: pg_tileserv
     environment:
-      - DATABASE_URL=postgresql://${APP_PGUSER:-iva_app}:${APP_PGPASSWORD}@postgis:5432/impacted_values?sslmode=disable
-      - TS_DEBUG=true    
+      DATABASE_URL: postgresql://iva_app:${APP_PGPASSWORD}@postgis:5432/impacted_values?sslmode=disable
+      TS_DEBUG: "true"
     volumes:
       - ./config/pg_tileserv.toml:/config/pg_tileserv.toml:ro
     ports:
@@ -87,8 +86,6 @@ services:
     depends_on:
       initdb:
         condition: service_completed_successfully
-      pgbouncer:
-        condition: service_started
     networks:
       - iva_net
 
@@ -96,16 +93,14 @@ services:
     image: pramsey/pg_featureserv:latest
     container_name: pg_featureserv
     environment:
-      - DATABASE_URL=postgresql://${APP_PGUSER:-iva_app}:${APP_PGPASSWORD}@pgbouncer:5432/impacted_values?sslmode=disable
-      - LISTEN_ADDR=0.0.0.0
-      - PORT=9000
+      DATABASE_URL: postgresql://iva_app:${APP_PGPASSWORD}@postgis:5432/impacted_values?sslmode=disable
+      LISTEN_ADDR: 0.0.0.0
+      PORT: 9000
     ports:
       - "9000:9000"
     depends_on:
       initdb:
         condition: service_completed_successfully
-      pgbouncer:
-        condition: service_started
     networks:
       - iva_net
 
@@ -113,29 +108,29 @@ services:
     build:
       context: ./job
     container_name: iva-job
-    env_file: [ .env ]
+    env_file: [.env]
     environment:
-      - FEATURE_SET_CODES=ecumene,first_nations,highways,rail,facilities,buildings
-      - IVA_RASTER_FEATURE_SETS=buildings
-      - IVA_BUILDINGCOUNT_RASTER=/data/IVA_buildingcount_100m.tif
-      - PGPASSWORD=${PGPASSWORD}
-      - PGHOST=postgis
-      - PGPORT=5432
-      - PGUSER=iva_job
-      - PGDATABASE=impacted_values
+      FEATURE_SET_CODES: ecumene,first_nations,highways,rail,facilities,census
+      IVA_BUILDINGCOUNT_RASTER: /data/IVA_buildingcount_100m.tif
+      PGPASSWORD: ${PGPASSWORD}
+      PGHOST: postgis
+      PGPORT: 5432
+      PGUSER: iva_job
+      PGDATABASE: impacted_values
     depends_on:
       postgis:
         condition: service_healthy
       initdb:
         condition: service_completed_successfully
+      load-zones:
+        condition: service_completed_successfully
     restart: on-failure
-    # Updated command: use CLI + explicit sequence
-    command: [
-      "bash", "-c",
-      "sleep 5 && \
-       python -m iva_job.loaders /data && \
-       python -m iva_job.cli --run-date 2026-04-21 --horizons 3,7 --skip-loader"
-    ]
+    command:
+      [
+        "bash",
+        "-c",
+        "python -m iva_job.main --horizons 3,7 --date 2026-04-21"
+      ]
     volumes:
       - ./data:/data:ro
     networks:

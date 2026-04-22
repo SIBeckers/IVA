@@ -30,7 +30,7 @@ from rasterio.coords import BoundingBox
 from rasterio.merge import merge
 from rasterio.transform import Affine
 from rasterio.vrt import WarpedVRT
-from rasterio.warp import Resampling
+from rasterio.warp import Resampling,transform_bounds
 
 from azure.storage.blob import ContainerClient
 from azure.storage.blob import BlobPrefix  # returned by walk_blobs when delimiter is used
@@ -230,7 +230,6 @@ def _safe_name(blob_name: str) -> str:
 def _download_one(cc: ContainerClient, blob_name: str, dest: Path) -> Path:
     """
     Download blob streaming in chunks to avoid loading entire blobs into RAM.
-    NOTE: Your previous version used stream.readall(), which can blow memory with concurrency. [1](https://041gc-my.sharepoint.com/personal/justin_beckers_nrcan-rncan_gc_ca/Documents/Microsoft%20Copilot%20Chat%20Files/firestarr.py)
     """
     tries, delay = 0, 1.0
     chunk_size = int(_env("FIRESTARR_DOWNLOAD_CHUNK_MB", "8")) * 1024 * 1024
@@ -287,7 +286,7 @@ def download_blobs(blob_names: Sequence[str]) -> List[Path]:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     t0 = time.time()
-    _log_resource_usage(f"START download_blobs ({len(blob_names)} blobs, max_workers={max_workers})")
+    # _log_resource_usage(f"START download_blobs ({len(blob_names)} blobs, max_workers={max_workers})")
     out: List[Path] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = []
@@ -383,7 +382,7 @@ def mosaic_tiles_reproject_first(
 ) -> Path:
     """
     Reproject each tile via WarpedVRT (nearest, fixed resolution) and mosaic via rasterio.merge
-    streaming to dst_path to avoid huge in-memory arrays. [2](https://whitephil.github.io/GIS-workshops/Rasterio/notebooks/2.%20Rasterio%20Clip%20Operations.html)
+    streaming to dst_path to avoid huge in-memory arrays.
     """
     if not tile_paths:
         raise ValueError("No tiles provided for mosaic")
@@ -476,15 +475,43 @@ def mosaic_tiles_reproject_first(
                 vrts,
                 method=method,
                 nodata=nodata,
+                bounds=(ab.left, ab.bottom, ab.right, ab.top),
+                res=(res, res),
                 target_aligned_pixels=True,
                 dst_path=str(out_path),
                 dst_kwds=profile,
                 mem_limit=mem_limit_mb,
-                # bounds is redundant here because we already baked bounds into transform/width/height.
             )
+
 
         with rasterio.open(out_path, "r+") as dst:
             _set_band_description_compat(dst, 1, "probability")
+
+            log.info("Actual output CRS: %s", dst.crs)
+            log.info("Actual output res: %s", dst.res)
+            log.info("Actual output transform: %s", dst.transform)
+
+            fx, fy = dst.res
+            if not (
+                math.isclose(abs(fx), res, rel_tol=0.0, abs_tol=1e-6)
+                and math.isclose(abs(fy), res, rel_tol=0.0, abs_tol=1e-6)
+            ):
+                raise RuntimeError(
+                    f"FireSTARR mosaic write produced wrong resolution: "
+                    f"expected {(res, res)}, got {dst.res}"
+                )
+
+            if not (
+                math.isclose(dst.transform.a, res, rel_tol=0.0, abs_tol=1e-6)
+                and math.isclose(abs(dst.transform.e), res, rel_tol=0.0, abs_tol=1e-6)
+                and math.isclose(dst.transform.c, ab.left, rel_tol=0.0, abs_tol=1e-6)
+                and math.isclose(dst.transform.f, ab.top, rel_tol=0.0, abs_tol=1e-6)
+            ):
+                raise RuntimeError(
+                    f"FireSTARR mosaic write produced wrong grid: "
+                    f"expected origin=({ab.left}, {ab.top}), res={res}, "
+                    f"got transform={dst.transform}"
+                )
 
         log.info("Wrote mosaic → %s (method=%s, CRS=%s, res=%.1fm)", out_path, method, dst_crs, res_m)
         return out_path
@@ -516,14 +543,27 @@ def reproject_single(
         if src.nodata is None:
             raise RuntimeError(f"Source raster has no nodata set: {src_path}")
 
+        tb = transform_bounds(src.crs, dst_crs, *src.bounds, densify_pts=21)
+        ab = _aligned_bounds(BoundingBox(*tb), float(res_m))
+        width, height, transform = _grid_from_bounds(ab, float(res_m))
+
         with WarpedVRT(
             src,
             crs=dst_crs,
+            transform=transform,
+            width=width,
+            height=height,
             resampling=Resampling.nearest,
-            resolution=(res_m, res_m),
             nodata=src.nodata,
         ) as vrt:
-            return _write_reproject_from_vrt(vrt, out_path, nodata=src.nodata)
+            out = _write_reproject_from_vrt(vrt, out_path, nodata=src.nodata)
+
+        with rasterio.open(out) as dst:
+            log.info("Archive reprojection output CRS: %s", dst.crs)
+            log.info("Archive reprojection output res: %s", dst.res)
+            log.info("Archive reprojection output transform: %s", dst.transform)
+
+        return out
 
 
 # -----------------------
