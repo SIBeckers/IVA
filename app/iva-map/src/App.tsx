@@ -28,9 +28,6 @@ export default function App() {
         projection: proj3978,
         center: center3978,
         extent: EXTENT_3978,
-
-        // Critical: lock the view to the ESRI/CBMT LOD ladder.
-        // OL tile math is driven by origin+resolutions+tileSize on the TileGrid. [1](https://devopscycle.com/blog/the-ultimate-docker-compose-cheat-sheet)[2](https://www.compilenrun.com/docs/devops/docker/docker-compose/docker-compose-yaml/)
         resolutions: GRID_RESOLUTIONS_3978,
         constrainResolution: true,
 

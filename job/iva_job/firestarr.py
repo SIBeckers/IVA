@@ -1,4 +1,3 @@
-# iva_job/firestarr.py
 """
 FireSTARR GeoTIFF retrieval + reprojection + mosaic, using Azure Blob Storage Python SDK.
 
@@ -9,7 +8,13 @@ Key OOM-hardening:
   - Hard sanity checks on mosaic grid size.
   - GDAL cache is capped via rasterio.Env(GDAL_CACHEMAX=...).
 
-See rasterio.merge.merge docs for dst_path/dst_kwds/mem_limit usage. [2](https://whitephil.github.io/GIS-workshops/Rasterio/notebooks/2.%20Rasterio%20Clip%20Operations.html)
+This version also exposes exact FireSTARR run provenance so callers can persist:
+  - source kind (m3 / archive)
+  - run token (YYYYMMDDHHMM)
+  - run timestamp
+  - run prefix
+  - forecast-valid date
+  - source blob names
 """
 
 from __future__ import annotations
@@ -20,55 +25,76 @@ import re
 import time
 import logging
 import tempfile
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+try:
+    import psutil
+    _psutil = True
+except ImportError:
+    _psutil = False
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import rasterio
+from azure.storage.blob import BlobPrefix, ContainerClient
 from rasterio.coords import BoundingBox
 from rasterio.merge import merge
 from rasterio.transform import Affine
 from rasterio.vrt import WarpedVRT
-from rasterio.warp import Resampling,transform_bounds
+from rasterio.warp import Resampling, transform_bounds
 
-from azure.storage.blob import ContainerClient
-from azure.storage.blob import BlobPrefix  # returned by walk_blobs when delimiter is used
 
 log = logging.getLogger("iva.firestarr")
 _TS_12_RE = re.compile(r"(\d{12})")  # YYYYMMDDHHMM
 
 
-# -----------------------
+@dataclass(frozen=True)
+class FirestarrRunMeta:
+    source_kind: str              # 'm3' or 'archive'
+    run_token: str                # YYYYMMDDHHMM, e.g. 202604211747
+    run_ts: datetime              # parsed timestamp
+    run_prefix: str               # e.g. firestarr/m3_202604211747/
+    forecast_for_date: date       # valid/forecast date for this horizon
+    blob_names: list[str]         # exact source blob names used
+
+
+# ---------------------------------------------------------------------
 # Logging
-# -----------------------
+# ---------------------------------------------------------------------
 def _setup_logging(force: bool = False) -> None:
     lvl = os.getenv("FIRESTARR_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")).upper().strip()
     level = getattr(logging, lvl, logging.INFO)
     root = logging.getLogger()
+
     if force:
         for h in list(root.handlers):
             root.removeHandler(h)
+
     if not root.handlers or force:
         logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
     else:
         root.setLevel(level)
 
-
-def _sample(items: Sequence[str], n: int = 10) -> List[str]:
-    items = list(items or [])
-    if len(items) <= n:
-        return items
-    return items[:n] + ["..."]
-
+def _quiet_azure_http_logging() -> None:
+    """
+    Reduce Azure SDK HTTP request/response logging noise.
+    Keep our own iva.firestarr INFO logs, but push Azure internals to WARNING.
+    """
+    logging.getLogger("azure").setLevel(logging.ERROR)
+    logging.getLogger("azure.core").setLevel(logging.ERROR)
+    logging.getLogger("azure.storage").setLevel(logging.ERROR)
+    logging.getLogger("azure.storage.blob").setLevel(logging.ERROR)
+    logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.ERROR)
 
 _setup_logging(force=False)
+_quiet_azure_http_logging()
 log.info("Loaded firestarr module from: %s", __file__)
 
 
-# -----------------------
+# ---------------------------------------------------------------------
 # Env helpers
-# -----------------------
+# ---------------------------------------------------------------------
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return v if v is not None and v != "" else default
@@ -85,12 +111,15 @@ def _parse_bounds_env(name: str) -> Optional[BoundingBox]:
     raw = _env(name, "").strip()
     if not raw:
         return None
+
     parts = [p.strip() for p in raw.split(",")]
     if len(parts) != 4:
         raise ValueError(f"{name} must be 'xmin,ymin,xmax,ymax' (got: {raw})")
+
     xmin, ymin, xmax, ymax = map(float, parts)
     if xmax <= xmin or ymax <= ymin:
         raise ValueError(f"{name} invalid bounds: {raw}")
+
     return BoundingBox(xmin, ymin, xmax, ymax)
 
 
@@ -98,29 +127,58 @@ def _ensure_container_url_has_sas(container_url: str) -> str:
     p = urlparse(container_url)
     if p.query:
         return container_url
+
     sas = _env("AZURE_SAS_TOKEN", "").lstrip("?")
     if not sas:
         return container_url
+
     q = dict(parse_qsl(p.query, keep_blank_values=True))
     q_sas = dict(parse_qsl(sas, keep_blank_values=True))
     q.update(q_sas)
+
     new_p = p._replace(query=urlencode(q))
     return urlunparse(new_p)
 
 
 def _container_client() -> ContainerClient:
-    raw = _env("FIRESTARR_BLOB_URL", "https://sawipsprodca.blob.core.windows.net/firestarr").rstrip("/")
+    raw = _env(
+        "FIRESTARR_BLOB_URL",
+        "https://sawipsprodca.blob.core.windows.net/firestarr",
+    ).rstrip("/")
     url = _ensure_container_url_has_sas(raw)
     cc = ContainerClient.from_container_url(url)
+
     if log.isEnabledFor(logging.DEBUG):
         has_q = bool(urlparse(url).query)
         log.debug("ContainerClient created: url=%s (has_sas=%s)", cc.url, has_q)
+
     return cc
 
 
-# -----------------------
+# ---------------------------------------------------------------------
+# Provenance helpers
+# ---------------------------------------------------------------------
+def _token_to_datetime(token: str) -> datetime:
+    return datetime.strptime(token, "%Y%m%d%H%M")
+
+
+def _archive_run_prefix_from_blob(blob_name: str) -> str:
+    # Example archive path style: archive/<run_prefix>/<file>.tif
+    return str(Path(blob_name).parent).replace("\\", "/") + "/"
+
+
+def _m3_run_prefix_from_blob(blob_name: str) -> str:
+    # Example m3 path style: firestarr/m3_202604211747/20260423/<tile>.tif
+    p = Path(blob_name)
+    parts = p.parts
+    if len(parts) < 3:
+        raise RuntimeError(f"Unexpected m3 blob path: {blob_name}")
+    return "/".join(parts[:-2]) + "/"
+
+
+# ---------------------------------------------------------------------
 # Azure traversal helpers
-# -----------------------
+# ---------------------------------------------------------------------
 def _extract_ts_yyyymmddhhmm(path: str) -> Optional[str]:
     m = _TS_12_RE.search(path)
     return m.group(1) if m else None
@@ -138,23 +196,27 @@ def _pick_latest_run_prefix_for_date(prefixes: Sequence[str], run_ymd: str) -> O
 def _list_child_prefixes(cc: ContainerClient, base_prefix: str) -> List[str]:
     base_prefix = base_prefix.strip("/") + "/"
     out: List[str] = []
+
     for item in cc.walk_blobs(name_starts_with=base_prefix, delimiter="/"):
         if isinstance(item, BlobPrefix):
             out.append(item.name)
+
     return out
 
 
 def _list_blobs_flat(cc: ContainerClient, prefix: str) -> List[str]:
     prefix = prefix.lstrip("/")
     names: List[str] = []
+
     for b in cc.list_blobs(name_starts_with=prefix):
         names.append(b.name)
+
     return names
 
 
-# -----------------------
+# ---------------------------------------------------------------------
 # Discovery
-# -----------------------
+# ---------------------------------------------------------------------
 def _discover_archive_blob(run_date: date, horizon: int) -> Optional[str]:
     cc = _container_client()
     archive_prefix = _env("FIRESTARR_ARCHIVE_PREFIX", "archive").strip("/").strip() + "/"
@@ -180,19 +242,22 @@ def _discover_archive_blob(run_date: date, horizon: int) -> Optional[str]:
         blobs = _list_blobs_flat(cc, run_prefix)
         tifs = [b for b in blobs if b.lower().endswith(".tif")]
         raise RuntimeError(
-            f"Expected archive file not found: {expected_blob}. Available tifs: {[Path(t).name for t in tifs]}"
+            f"Expected archive file not found: {expected_blob}. "
+            f"Available tifs: {[Path(t).name for t in tifs]}"
         ) from e
 
 
 def _m3_root_candidates() -> List[str]:
     multi = _env("FIRESTARR_M3_PREFIXES", "").strip()
     single = _env("FIRESTARR_M3_PREFIX", "").strip()
+
     if multi:
         roots = [r.strip().strip("/") for r in multi.split(",") if r.strip()]
     elif single:
         roots = [single.strip().strip("/")]
     else:
         roots = ["firestarr", "firestarr/firestarr"]
+
     return [r + "/" for r in roots]
 
 
@@ -220,9 +285,9 @@ def _discover_m3_blobs(run_date: date, horizon: int) -> Optional[List[str]]:
     return tifs or None
 
 
-# -----------------------
+# ---------------------------------------------------------------------
 # Download (OOM-safe streaming)
-# -----------------------
+# ---------------------------------------------------------------------
 def _safe_name(blob_name: str) -> str:
     return Path(blob_name).name
 
@@ -232,17 +297,15 @@ def _download_one(cc: ContainerClient, blob_name: str, dest: Path) -> Path:
     Download blob streaming in chunks to avoid loading entire blobs into RAM.
     """
     tries, delay = 0, 1.0
-    chunk_size = int(_env("FIRESTARR_DOWNLOAD_CHUNK_MB", "8")) * 1024 * 1024
 
     while True:
         tries += 1
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
             bc = cc.get_blob_client(blob_name)
+            stream = bc.download_blob(logging_enable=False)
 
-            stream = bc.download_blob()
             with open(dest, "wb") as f:
-                # Stream in chunks; avoids huge transient allocations.
                 for chunk in stream.chunks():
                     f.write(chunk)
 
@@ -252,27 +315,23 @@ def _download_one(cc: ContainerClient, blob_name: str, dest: Path) -> Path:
             if tries >= 5:
                 log.error("Download failed after %d tries: %s (%s)", tries, blob_name, e)
                 raise
+
             log.warning(
                 "Download failed (try %d/5): %s (%s). Retrying in %.1fs",
-                tries, blob_name, e, delay
+                tries, blob_name, e, delay,
             )
             time.sleep(delay)
             delay = min(delay * 2, 16.0)
 
 
 def download_blobs(blob_names: Sequence[str]) -> List[Path]:
-    import time
-    try:
-        import psutil
-        _psutil = True
-    except ImportError:
-        _psutil = False
-    def _log_resource_usage(msg):
+
+    def _log_resource_usage(msg: str) -> None:
         if _psutil:
             p = psutil.Process(os.getpid())
             mem = p.memory_info().rss / (1024 * 1024)
             cpu = p.cpu_percent(interval=0.1)
-            log.info(f"[RES] {msg} | mem={mem:.1f}MB cpu={cpu:.1f}%%")
+            log.info(f"[RES] {msg} | mem={mem:.1f}MB cpu={cpu:.1f}%")
         else:
             log.info(f"[RES] {msg} | os.times={os.times()}")
 
@@ -280,24 +339,23 @@ def download_blobs(blob_names: Sequence[str]) -> List[Path]:
     tmp_root = Path(_env("FIRESTARR_TMP", _env("IVA_TMP", "/tmp")))
     tmpdir = Path(tempfile.mkdtemp(prefix="firestarr_", dir=str(tmp_root)))
 
-    # Concurrency is a memory multiplier. Default it lower.
     max_workers = int(_env("FIRESTARR_MAX_WORKERS", "4"))
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     t0 = time.time()
-    # _log_resource_usage(f"START download_blobs ({len(blob_names)} blobs, max_workers={max_workers})")
     out: List[Path] = []
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = []
         for name in blob_names:
             fn = tmpdir / _safe_name(name)
             futs.append(ex.submit(_download_one, cc, name, fn))
+
         for fut in as_completed(futs):
             p = fut.result()
             log.info("Downloaded: %s", p.name)
             out.append(p)
-    log.info("[TIMER] download_blobs: %.2fs", time.time()-t0)
+
+    log.info("[TIMER] download_blobs: %.2fs", time.time() - t0)
     _log_resource_usage("END download_blobs")
     return out
 
@@ -306,6 +364,7 @@ def _set_band_description_compat(dst, bidx: int, desc: str) -> None:
     if hasattr(dst, "set_band_description"):
         dst.set_band_description(bidx, desc)
         return
+
     try:
         descs = list(getattr(dst, "descriptions", ()) or ())
         while len(descs) < bidx:
@@ -316,11 +375,12 @@ def _set_band_description_compat(dst, bidx: int, desc: str) -> None:
         pass
 
 
-# -----------------------
+# ---------------------------------------------------------------------
 # Reproject helpers
-# -----------------------
+# ---------------------------------------------------------------------
 def _write_reproject_from_vrt(vrt: WarpedVRT, out_path: Path, *, nodata) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
     data = vrt.read(1)
     profile = vrt.profile.copy()
     profile.update(
@@ -333,24 +393,28 @@ def _write_reproject_from_vrt(vrt: WarpedVRT, out_path: Path, *, nodata) -> Path
         nodata=nodata,
         BIGTIFF="IF_SAFER",
     )
+
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(data, 1)
         _set_band_description_compat(dst, 1, "probability")
+
     return out_path
 
 
-# -----------------------
+# ---------------------------------------------------------------------
 # Mosaic grid helpers
-# -----------------------
+# ---------------------------------------------------------------------
 def _union_bounds(datasets) -> BoundingBox:
     b0 = datasets[0].bounds
     left, bottom, right, top = b0.left, b0.bottom, b0.right, b0.top
+
     for ds in datasets[1:]:
         b = ds.bounds
         left = min(left, b.left)
         bottom = min(bottom, b.bottom)
         right = max(right, b.right)
         top = max(top, b.top)
+
     return BoundingBox(left, bottom, right, top)
 
 
@@ -369,9 +433,9 @@ def _grid_from_bounds(bounds: BoundingBox, res: float) -> tuple[int, int, Affine
     return width, height, transform
 
 
-# -----------------------
+# ---------------------------------------------------------------------
 # Mosaic (reproject first, streaming merge)
-# -----------------------
+# ---------------------------------------------------------------------
 def mosaic_tiles_reproject_first(
     tile_paths: Sequence[Path],
     out_path: Path,
@@ -381,8 +445,8 @@ def mosaic_tiles_reproject_first(
     method: str = "max",
 ) -> Path:
     """
-    Reproject each tile via WarpedVRT (nearest, fixed resolution) and mosaic via rasterio.merge
-    streaming to dst_path to avoid huge in-memory arrays.
+    Reproject each tile via WarpedVRT (nearest, fixed resolution) and mosaic via
+    rasterio.merge.merge() streaming to dst_path.
     """
     if not tile_paths:
         raise ValueError("No tiles provided for mosaic")
@@ -417,27 +481,23 @@ def mosaic_tiles_reproject_first(
 
         res = float(res_m)
 
-        # Prefer explicit bounds if provided to avoid mosaicking huge empty space.
         user_bounds = _parse_bounds_env("FIRESTARR_MOSAIC_BOUNDS")
         ub = user_bounds or _union_bounds(vrts)
         ab = _aligned_bounds(ub, res)
         width, height, transform = _grid_from_bounds(ab, res)
 
-        # Sanity guardrails (fail loudly rather than get OOM-killed)
-        max_pixels = int(_env("FIRESTARR_MAX_PIXELS", "2000000000"))  # 2B default
+        max_pixels = int(_env("FIRESTARR_MAX_PIXELS", "2000000000"))
         pixels = width * height
         if pixels <= 0:
             raise RuntimeError(f"Computed invalid mosaic grid: {width}x{height} for bounds={ab}")
         if pixels > max_pixels:
             raise RuntimeError(
-                f"Mosaic grid too large: {width}x{height} ({pixels:,} pixels) > FIRESTARR_MAX_PIXELS={max_pixels:,}. "
+                f"Mosaic grid too large: {width}x{height} ({pixels:,} pixels) > "
+                f"FIRESTARR_MAX_PIXELS={max_pixels:,}. "
                 f"Set FIRESTARR_MOSAIC_BOUNDS to clip output."
             )
 
-        # Estimate raw payload (not compressed) for intuition
-        dtype = vrts[0].dtypes[0]
-        bpp = rasterio.dtypes.get_minimum_dtype([dtype]).itemsize if hasattr(dtype, "itemsize") else 4
-        est_gb = (pixels * bpp) / (1024**3)  # assume ~4 bytes per pixel typical float32
+        est_gb = (pixels * 4) / (1024**3)  # float32-ish estimate
         log.info("Mosaic bounds used: %s (user=%s)", ab, bool(user_bounds))
         log.info("Mosaic grid: %dx%d (~%.2f GB raw for float32-ish)", width, height, est_gb)
 
@@ -466,10 +526,9 @@ def mosaic_tiles_reproject_first(
         log.info("Writing mosaic to %s", out_path)
         log.info(
             "Updated profile for mosaic (streaming), size=%dx%d, mem_limit=%dMB, GDAL_CACHEMAX=%dMB, GDAL_NUM_THREADS=%s",
-            width, height, mem_limit_mb, gdal_cache_mb, gdal_threads
+            width, height, mem_limit_mb, gdal_cache_mb, gdal_threads,
         )
 
-        # Cap GDAL cache to avoid silent ballooning.
         with rasterio.Env(GDAL_CACHEMAX=gdal_cache_mb, GDAL_NUM_THREADS=gdal_threads):
             merge(
                 vrts,
@@ -482,7 +541,6 @@ def mosaic_tiles_reproject_first(
                 dst_kwds=profile,
                 mem_limit=mem_limit_mb,
             )
-
 
         with rasterio.open(out_path, "r+") as dst:
             _set_band_description_compat(dst, 1, "probability")
@@ -537,6 +595,7 @@ def reproject_single(
     res_m: float = 100.0,
 ) -> Path:
     dst_crs = f"EPSG:{dst_epsg}"
+
     with rasterio.open(src_path) as src:
         if src.count != 1:
             raise RuntimeError(f"Expected single-band raster; got {src.count} bands: {src_path}")
@@ -566,16 +625,20 @@ def reproject_single(
         return out
 
 
-# -----------------------
+# ---------------------------------------------------------------------
 # Public API
-# -----------------------
-def get_firestarr_mosaic(run_date: date, day: int, out_dir: Path) -> Path:
+# ---------------------------------------------------------------------
+def get_firestarr_mosaic_info(run_date: date, day: int, out_dir: Path) -> tuple[Path, FirestarrRunMeta]:
+    """
+    Return both the mosaic path and the exact FireSTARR run provenance used.
+    """
     dst_epsg = int(_env("FIRESTARR_DST_EPSG", "3978"))
     res_m = float(_env("FIRESTARR_RES_M", "100.0"))
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    forecast_for_date = run_date + timedelta(days=int(day) - 1)
     out_name = f"firestarr_{_ymd(run_date)}_day_{int(day):02d}_probability_epsg{dst_epsg}_{int(res_m)}m.tif"
     out_path = out_dir / out_name
 
@@ -584,16 +647,58 @@ def get_firestarr_mosaic(run_date: date, day: int, out_dir: Path) -> Path:
     if archive_blob:
         log.info("Using archive blob: %s", archive_blob)
         local = download_blobs([archive_blob])[0]
-        return reproject_single(local, out_path, dst_epsg=dst_epsg, res_m=res_m)
+        out = reproject_single(local, out_path, dst_epsg=dst_epsg, res_m=res_m)
+
+        token = _extract_ts_yyyymmddhhmm(archive_blob)
+        if not token:
+            raise RuntimeError(f"Could not extract FireSTARR run token from archive blob: {archive_blob}")
+
+        meta = FirestarrRunMeta(
+            source_kind="archive",
+            run_token=token,
+            run_ts=_token_to_datetime(token),
+            run_prefix=_archive_run_prefix_from_blob(archive_blob),
+            forecast_for_date=forecast_for_date,
+            blob_names=[archive_blob],
+        )
+        return out, meta
 
     # 2) m3 tiles
     m3_blobs = _discover_m3_blobs(run_date, int(day))
     if m3_blobs:
         log.info("Using m3 blobs: %d tile(s)", len(m3_blobs))
         tiles = download_blobs(m3_blobs)
-        return mosaic_tiles_reproject_first(tiles, out_path, dst_epsg=dst_epsg, res_m=res_m, method="max")
+        out = mosaic_tiles_reproject_first(
+            tiles,
+            out_path,
+            dst_epsg=dst_epsg,
+            res_m=res_m,
+            method="max",
+        )
 
-    raise RuntimeError(f"No FireSTARR data found for run_date={run_date.isoformat()} day={day} in archive or m3")
+        token = _extract_ts_yyyymmddhhmm(m3_blobs[0])
+        if not token:
+            raise RuntimeError(f"Could not extract FireSTARR run token from m3 blob: {m3_blobs[0]}")
+
+        meta = FirestarrRunMeta(
+            source_kind="m3",
+            run_token=token,
+            run_ts=_token_to_datetime(token),
+            run_prefix=_m3_run_prefix_from_blob(m3_blobs[0]),
+            forecast_for_date=forecast_for_date,
+            blob_names=list(m3_blobs),
+        )
+        return out, meta
+
+    raise RuntimeError(
+        f"No FireSTARR data found for run_date={run_date.isoformat()} "
+        f"day={day} in archive or m3"
+    )
+
+
+def get_firestarr_mosaic(run_date: date, day: int, out_dir: Path) -> Path:
+    out_path, _meta = get_firestarr_mosaic_info(run_date, day, out_dir)
+    return out_path
 
 
 def get_firestarr_dayN_and_day7(run_date: date, forecast_day: int, out_dir: Path) -> Tuple[Path, Path]:
@@ -618,8 +723,10 @@ if __name__ == "__main__":
 
     rd = date.fromisoformat(args.run_date)
     out = Path(args.out_dir)
+
     p = get_firestarr_mosaic(rd, args.day, out)
     log.info("Output: %s", p)
+
     if args.also_day7 and args.day != 7:
         p7 = get_firestarr_mosaic(rd, 7, out)
         log.info("Output day7: %s", p7)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -18,30 +19,76 @@ def connect_writer() -> psycopg.Connection:
 
 def insert_run(
     cur,
+    *,
     run_date,
-    forecast_day,
+    forecast_day: int,
+    forecast_for_date,
     wmstime,
+    firestarr_source_kind: str,
+    firestarr_run_token: str,
+    firestarr_run_ts,
+    firestarr_run_prefix: str,
     unsigned_urls,
     res_m: int = 100,
     srs: int = 3978,
     blob_names: Any = None,
 ) -> int:
+    """
+    Insert/update one processed FireSTARR cycle + horizon.
+
+    Uniqueness is per (run_date, forecast_day, firestarr_run_token),
+    so multiple FireSTARR runs on the same date can coexist.
+
+    Notes:
+      - blob_uris is stored as text[]
+      - blob_names is stored as jsonb and must be valid JSON text
+    """
     cur.execute(
         """
         INSERT INTO risk.runs (
-            run_date, forecast_day, wmstime, srs, res_m, blob_uris, blob_names
+            run_date,
+            forecast_day,
+            forecast_for_date,
+            wmstime,
+            firestarr_source_kind,
+            firestarr_run_token,
+            firestarr_run_ts,
+            firestarr_run_prefix,
+            srs,
+            res_m,
+            blob_uris,
+            blob_names
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
-        ON CONFLICT (run_date, forecast_day)
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+        )
+        ON CONFLICT (run_date, forecast_day, firestarr_run_token)
         DO UPDATE SET
-            wmstime   = EXCLUDED.wmstime,
-            srs       = EXCLUDED.srs,
-            res_m     = EXCLUDED.res_m,
-            blob_uris = EXCLUDED.blob_uris,
-            blob_names = EXCLUDED.blob_names
+            forecast_for_date     = EXCLUDED.forecast_for_date,
+            wmstime               = EXCLUDED.wmstime,
+            firestarr_source_kind = EXCLUDED.firestarr_source_kind,
+            firestarr_run_ts      = EXCLUDED.firestarr_run_ts,
+            firestarr_run_prefix  = EXCLUDED.firestarr_run_prefix,
+            srs                   = EXCLUDED.srs,
+            res_m                 = EXCLUDED.res_m,
+            blob_uris             = EXCLUDED.blob_uris,
+            blob_names            = EXCLUDED.blob_names
         RETURNING id
         """,
-        (run_date, forecast_day, wmstime, srs, res_m, unsigned_urls or [], blob_names),
+        (
+            run_date,
+            forecast_day,
+            forecast_for_date,
+            wmstime,
+            firestarr_source_kind,
+            firestarr_run_token,
+            firestarr_run_ts,
+            firestarr_run_prefix,
+            srs,
+            res_m,
+            unsigned_urls or [],
+            json.dumps(blob_names or []),
+        ),
     )
     return cur.fetchone()[0]
 

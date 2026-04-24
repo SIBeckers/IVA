@@ -21,6 +21,33 @@ logging.basicConfig(
 EPSG = 3978
 
 
+REQUIRED_FEATURE_SET_CODES = {
+    "ecumene",
+    "first_nations",
+    "highways",
+    "rail",
+    "facilities",
+    "census",
+}
+
+
+def _loaded_feature_set_codes(conn: psycopg.Connection) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT fs.code
+            FROM risk.features f
+            JOIN risk.feature_sets fs
+              ON fs.id = f.feature_set_id
+            """
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
+def _zones_already_loaded(conn: psycopg.Connection) -> bool:
+    loaded = _loaded_feature_set_codes(conn)
+    return REQUIRED_FEATURE_SET_CODES.issubset(loaded)
+
 # ---------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------
@@ -249,42 +276,52 @@ def _upsert_features(
 def load_all(data_dir: str = "/data") -> None:
     conn = connect_with_retry()
 
-    sources = [
-        ("ecumene", Path(data_dir) / "ECUMENE_V3.gpkg"),
-        ("first_nations", Path(data_dir) / "FirstNations.gpkg"),
-        ("highways", Path(data_dir) / "highways_v2.gpkg"),
-        ("rail", Path(data_dir) / "railways_v2.gpkg"),
-        ("facilities", Path(data_dir) / "facilities.gpkg"),
-        ("census", Path(data_dir) / "lcsd000a25p_e.gpkg"),
-    ]
+    force_reload = os.getenv("FORCE_RELOAD_ZONES", "").strip().lower() in {"1", "true", "yes"}
+    
+    if not force_reload and _zones_already_loaded(conn):
+        log.info("Zones already loaded; skipping iva-load-zones")
+        conn.close()
+        return
 
-    for code, path in sources:
-        if not path.exists():
-            raise FileNotFoundError(f"Missing source file: {path}")
+    data_dir = str(data_dir)
 
-        log.info("Loading %s from %s", code, path)
-        gdf = _read_gpkg(path)
+    try:
+        sources = [
+            ("ecumene", Path(data_dir) / "ECUMENE_V3.gpkg"),
+            ("first_nations", Path(data_dir) / "FirstNations.gpkg"),
+            ("highways", Path(data_dir) / "highways_v2.gpkg"),
+            ("rail", Path(data_dir) / "railways_v2.gpkg"),
+            ("facilities", Path(data_dir) / "facilities.gpkg"),
+            ("census", Path(data_dir) / "lcsd000a25p_e.gpkg"),
+        ]
 
-        if code == "census":
-            _upsert_census_table(conn, gdf)
-            _upsert_features(
-                conn,
-                gdf,
-                feature_set_code="census",
-                pk_candidates=["CSDUID", "csduid"],
-                name_candidates=["CSDNAME", "name"],
-            )
-        else:
-            _upsert_features(
-                conn,
-                gdf,
-                feature_set_code=code,
-                pk_candidates=["SOURCE_PK", "OBJECTID", "ID", "id", "fid", "FID"],
-                name_candidates=["NAME", "name", "ENG_NAME", "FULLNAME", "OSM_NAME", "FIRST_NATION_NAME"],
-            )
+        for code, path in sources:
+            if not path.exists():
+                raise FileNotFoundError(f"Missing source file: {path}")
 
-    conn.close()
-    log.info("Zone loading complete")
+            log.info("Loading %s from %s", code, path)
+            gdf = _read_gpkg(path)
+
+            if code == "census":
+                _upsert_census_table(conn, gdf)
+                _upsert_features(
+                    conn,
+                    gdf,
+                    feature_set_code="census",
+                    pk_candidates=["CSDUID", "csduid"],
+                    name_candidates=["CSDNAME", "name"],
+                )
+            else:
+                _upsert_features(
+                    conn,
+                    gdf,
+                    feature_set_code=code,
+                    pk_candidates=["SOURCE_PK", "OBJECTID", "ID", "id", "fid", "FID"],
+                    name_candidates=["NAME", "name", "ENG_NAME", "FULLNAME", "OSM_NAME", "FIRST_NATION_NAME"],
+                )
+    finally:
+        conn.close()
+        log.info("Zone loading complete")
 
 
 if __name__ == "__main__":

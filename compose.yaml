@@ -10,10 +10,11 @@ services:
       POSTGRES_USER: iva_job
       POSTGRES_PASSWORD: ${PGPASSWORD}
       POSTGRES_INITDB_ARGS: --auth=scram-sha-256
+      PGDATA: /var/lib/postgresql/data
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql
+      - pgdata:/var/lib/postgresql/data
       - ./db/ddl.sql:/ddl/ddl.sql:ro
       - ./data:/data:ro
     healthcheck:
@@ -51,6 +52,7 @@ services:
     build:
       context: ./job
     container_name: iva-load-zones
+    profiles: ["bootstrap"]
     env_file: [.env]
     environment:
       PGPASSWORD: ${PGPASSWORD}
@@ -58,6 +60,7 @@ services:
       PGPORT: 5432
       PGUSER: iva_job
       PGDATABASE: impacted_values
+      FORCE_RELOAD_ZONES: ${FORCE_RELOAD_ZONES:-0}
     depends_on:
       initdb:
         condition: service_completed_successfully
@@ -121,8 +124,6 @@ services:
       postgis:
         condition: service_healthy
       initdb:
-        condition: service_completed_successfully
-      load-zones:
         condition: service_completed_successfully
     restart: on-failure
     command:

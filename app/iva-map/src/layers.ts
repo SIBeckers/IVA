@@ -77,8 +77,6 @@ function mvt(id: string, url: string, style?: (f: any) => Style) {
     format: new MVT(),
     url,
     projection: proj3857,
-    // This is the critical piece: OL computes tile extents based on origin/resolutions/tileSize. [1](https://devopscycle.com/blog/the-ultimate-docker-compose-cheat-sheet)[2](https://www.compilenrun.com/docs/devops/docker/docker-compose/docker-compose-yaml/)
-    // tileGrid: tileGrid3978,
   });
 
   if (DEBUG_TILE_COUNTS) {
@@ -97,7 +95,6 @@ function mvt(id: string, url: string, style?: (f: any) => Style) {
     visible: true,
     renderBuffer: 256,
     renderMode: 'hybrid',
-    overlaps: false,
   });
 
   layer.set('id', id);

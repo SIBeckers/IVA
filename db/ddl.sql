@@ -1,5 +1,7 @@
 -- =====================================================================
 -- IVA Database DDL (Full Replacement, Raster-First Buildings, CSD Zones)
+-- Adds explicit FireSTARR cycle metadata to risk.runs so multiple runs
+-- per date can coexist and the UI can filter by date then by FireSTARR run.
 -- CRS: EPSG:3978
 -- =====================================================================
 
@@ -27,7 +29,6 @@ ALTER ROLE iva_job WITH PASSWORD :'job_pass';
 -- Schemas
 -- ---------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS risk;
-
 GRANT USAGE ON SCHEMA risk TO iva_app, iva_job;
 
 -- ---------------------------------------------------------------------
@@ -68,18 +69,37 @@ CREATE INDEX IF NOT EXISTS features_geom_gix
 -- ---------------------------------------------------------------------
 -- Runs
 -- ---------------------------------------------------------------------
+-- We explicitly capture the processed FireSTARR cycle so multiple runs
+-- on the same date/horizon can coexist.
 CREATE TABLE IF NOT EXISTS risk.runs (
-  id            bigserial PRIMARY KEY,
-  run_date      date NOT NULL,
-  forecast_day  integer NOT NULL CHECK (forecast_day IN (3,7)),
-  wmstime       date NOT NULL,
-  srs           integer NOT NULL DEFAULT 3978,
-  res_m         integer NOT NULL DEFAULT 100,
-  blob_uris     text[] NOT NULL DEFAULT '{}',
-  blob_names    jsonb,
-  created_at    timestamptz DEFAULT now(),
-  UNIQUE (run_date, forecast_day)
+  id                    bigserial PRIMARY KEY,
+  run_date              date NOT NULL,                      -- model-run date selected by user / processing date
+  forecast_day          integer NOT NULL CHECK (forecast_day IN (3,7)),
+  forecast_for_date     date NOT NULL,                      -- valid/forecast date for this horizon
+  wmstime               date NOT NULL,                      -- preserved for compatibility; currently coarse
+  firestarr_source_kind text NOT NULL CHECK (firestarr_source_kind IN ('m3','archive')),
+  firestarr_run_token   text NOT NULL,                      -- raw YYYYMMDDHHMM token, e.g. 202604211747
+  firestarr_run_ts      timestamp NOT NULL,                 -- parsed timestamp from the token
+  firestarr_run_prefix  text NOT NULL,                      -- e.g. firestarr/m3_202604211747/
+  srs                   integer NOT NULL DEFAULT 3978,
+  res_m                 integer NOT NULL DEFAULT 100,
+  blob_uris             text[] NOT NULL DEFAULT '{}',
+  blob_names            jsonb NOT NULL DEFAULT '[]'::jsonb,
+  created_at            timestamptz DEFAULT now(),
+  UNIQUE (run_date, forecast_day, firestarr_run_token)
 );
+
+CREATE INDEX IF NOT EXISTS runs_run_date_idx
+  ON risk.runs (run_date);
+
+CREATE INDEX IF NOT EXISTS runs_forecast_day_idx
+  ON risk.runs (forecast_day);
+
+CREATE INDEX IF NOT EXISTS runs_firestarr_run_ts_idx
+  ON risk.runs (firestarr_run_ts DESC);
+
+CREATE INDEX IF NOT EXISTS runs_run_date_firestarr_run_ts_idx
+  ON risk.runs (run_date, firestarr_run_ts DESC);
 
 -- ---------------------------------------------------------------------
 -- FireSTARR zonal statistics (continuous probability stats)
@@ -103,6 +123,7 @@ CREATE TABLE IF NOT EXISTS risk.feature_stats (
 
 CREATE INDEX IF NOT EXISTS feature_stats_feature_idx
   ON risk.feature_stats (feature_id);
+
 CREATE INDEX IF NOT EXISTS feature_stats_run_idx
   ON risk.feature_stats (run_id);
 
@@ -120,8 +141,10 @@ CREATE TABLE IF NOT EXISTS risk.building_zone_stats (
 
 CREATE INDEX IF NOT EXISTS building_zone_stats_set_idx
   ON risk.building_zone_stats (feature_set_id);
+
 CREATE INDEX IF NOT EXISTS building_zone_stats_feature_idx
   ON risk.building_zone_stats (feature_id);
+
 CREATE INDEX IF NOT EXISTS building_zone_stats_run_idx
   ON risk.building_zone_stats (run_id);
 
@@ -136,8 +159,10 @@ CREATE TABLE IF NOT EXISTS risk.building_zone_exposure (
 
 CREATE INDEX IF NOT EXISTS building_zone_exposure_set_idx
   ON risk.building_zone_exposure (feature_set_id);
+
 CREATE INDEX IF NOT EXISTS building_zone_exposure_feature_idx
   ON risk.building_zone_exposure (feature_id);
+
 CREATE INDEX IF NOT EXISTS building_zone_exposure_run_idx
   ON risk.building_zone_exposure (run_id);
 
@@ -157,21 +182,50 @@ CREATE INDEX IF NOT EXISTS csd_2025_geom_gix
 GRANT SELECT ON public.census_subdivisions_2025 TO iva_app, iva_job;
 
 -- ---------------------------------------------------------------------
--- Latest-run helpers
+-- Helper views
 -- ---------------------------------------------------------------------
+
+-- Latest run per horizon, but now based on the exact FireSTARR run timestamp.
 CREATE OR REPLACE VIEW risk.v_latest_runs AS
 SELECT DISTINCT ON (forecast_day)
-  id, run_date, forecast_day, wmstime, srs, res_m, created_at
+  id,
+  run_date,
+  forecast_day,
+  forecast_for_date,
+  wmstime,
+  firestarr_source_kind,
+  firestarr_run_token,
+  firestarr_run_ts,
+  firestarr_run_prefix,
+  srs,
+  res_m,
+  blob_uris,
+  blob_names,
+  created_at
 FROM risk.runs
-ORDER BY forecast_day, run_date DESC, id DESC;
+ORDER BY forecast_day, firestarr_run_ts DESC, id DESC;
 
--- ---------------------------------------------------------------------
--- Latest joined zone stats
--- ---------------------------------------------------------------------
+-- UI helper: for a selected date, list the distinct FireSTARR runs available.
+CREATE OR REPLACE VIEW risk.v_firestarr_runs_by_date AS
+SELECT DISTINCT
+  run_date,
+  firestarr_source_kind,
+  firestarr_run_token,
+  firestarr_run_ts,
+  firestarr_run_prefix
+FROM risk.runs
+ORDER BY run_date DESC, firestarr_run_ts DESC;
+
+-- Joined latest zone stats
 CREATE OR REPLACE VIEW risk.v_latest_zone_stats AS
 SELECT
   r.run_date,
   r.forecast_day,
+  r.forecast_for_date,
+  r.firestarr_source_kind,
+  r.firestarr_run_token,
+  r.firestarr_run_ts,
+  r.firestarr_run_prefix,
   f.id AS feature_id,
   fs.code AS feature_set,
   f.source_pk,

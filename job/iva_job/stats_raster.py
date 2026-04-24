@@ -87,6 +87,7 @@ def building_zone_metrics(
         return 0, 0.0
 
     building_count = int(np.sum(bld_filled[valid]))
-    expected_buildings = float(np.sum(bld_filled[valid] * fire_filled[valid]))
+    fire_prob = np.clip(fire_filled, 0.0, 1.0)
+    expected_buildings = float(np.sum(bld_filled[valid] * fire_prob[valid]))
 
     return building_count, expected_buildings

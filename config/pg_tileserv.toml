@@ -3,10 +3,3 @@ HttpPort = 7800
 
 DefaultMinZoom = 0
 DefaultMaxZoom = 23
-
-# [CoordinateSystem]
-# SRID = 3978
-# Xmin = -34655613.4786
-# Ymin = -30001471.1637833
-# Xmax =  34655613.4787
-# Ymax =  37640131.7239

@@ -10,6 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@gcds-core/components": "^1.2.0",
+    "@gcds-core/components-react": "^1.2.0",
     "ol": "^10.7.0",
     "ol-mapbox-style": "^13.2.0",
     "proj4": "^2.10.0",
